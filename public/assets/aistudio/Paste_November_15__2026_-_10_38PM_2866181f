@@ -1,0 +1,1479 @@
+All green. I built this slice as a single stdlib-only file and ran the full test suite in the sandbox against canned RSS/arXiv/YouTube feeds plus a real git repo — **11/11 checks passed**, including three consecutive end-to-end runs proving incremental dedupe (4 drops → 0 re-drops → exactly 1 new paper), the two-commit git review trail, locking, and dry-run.
+
+One clarification before the code: the Postgres sync engine doesn't exist yet — that's the *next* slice. Today, "ripple into the graph" means the Librarian edits markdown and Obsidian's graph updates live. So this agent is built with the seam already in place: a `sync.command` hook that fires after every successful Librarian run, plus JSON run reports. When we build the projection engine, it plugs in with one config line — zero changes to this agent.
+
+## The loop this slice closes
+
+```
+cron (06:30)
+   │
+   ▼
+Research Agent ── fetch ──► arXiv API (Atom)
+   │                        YouTube uploads RSS (no API key, no quota)
+   │                        any RSS 2.0 / Atom blog
+   │
+   ├─ dedupe vs state.json ─ cap per source ─ global budget
+   ▼
+Inbox/*.md  (structured drops: URL, abstract, tags, coverage hints)
+   │
+   ├─ git commit "research agent: N inbox drops"
+   ▼
+headless Librarian:  claude -p "Run the daily routine per CLAUDE.md" 
+   │                 (Phase 0 rulebook: Raw → Summary → ripple → Doctrine/Armory)
+   ├─ git commit "librarian: processed inbox"
+   ▼
+sync.command hook  ◄── Phase 1 Postgres projection plugs in here
+   │
+   ▼
+logs/run-*.json + optional Slack/Discord notification
+```
+
+## `CortexResearch/research_agent.py`
+
+```python
+#!/usr/bin/env python3
+# CortexOS Research Agent - Phase 0.5 slice
+# RSS / arXiv / YouTube competitor uploads -> Inbox/ -> headless Librarian -> sync hook
+# Stdlib only. Python 3.9+. Tested: parsers, dedupe, budgets, locking, git, dry-run.
+
+import os, re, sys, json, time, html, shutil, logging, argparse
+import urllib.request, urllib.parse, urllib.error
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import subprocess
+
+FM = "-" * 3
+UA = "CortexOS-ResearchAgent/0.1 (personal knowledge vault)"
+ATOM = "{http://www.w3.org/2005/Atom}"
+YTNS = "{http://www.youtube.com/xml/schemas/2015}"
+MRSS = "{http://search.yahoo.com/mrss/}"
+ARXIV_API = "http://export.arxiv.org/api/query"
+YT_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id="
+LOG = logging.getLogger("research_agent")
+SEEN_CAP = 8000
+
+def now_date():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def stamp():
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+DEFAULT_CONFIG = {
+    "vault": "../CortexVault",
+    "budget_per_run": 12,
+    "max_per_source": 5,
+    "polite_delay_s": 1.0,
+    "http_timeout_s": 30,
+    "librarian": {
+        "enabled": True,
+        "command": ["claude", "-p",
+                    "Run the daily routine per CLAUDE.md: process Inbox fully, "
+                    "reconcile the board, fix broken links, append the Log entry.",
+                    "--permission-mode", "acceptEdits"],
+        "timeout_s": 900
+    },
+    "git": {"auto_commit": True},
+    "sync": {"command": None},
+    "notify": {"webhook_url": None, "style": "slack"},
+    "sources": [
+        {"name": "Wes Roth", "kind": "youtube", "handle": "@WesRoth",
+         "priority": 1, "tags": ["competitor-coverage", "ai-news"]},
+        {"name": "arXiv AI/CL/LG", "kind": "arxiv",
+         "categories": ["cs.AI", "cs.CL", "cs.LG"], "fetch": 40, "priority": 2},
+        {"name": "Google AI Blog", "kind": "rss",
+         "url": "https://blog.google/technology/ai/rss/", "priority": 3},
+        {"name": "Hugging Face Blog", "kind": "rss",
+         "url": "https://huggingface.co/blog/feed.xml", "priority": 3}
+    ]
+}
+
+# ---------------------------------------------------------------- http + parsing
+
+class FetchError(Exception):
+    pass
+
+def http_get(url, timeout=30, retries=2):
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+    raise FetchError(f"{url} -> {last}")
+
+def strip_html(s):
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+def clip(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+def parse_date(s):
+    if not s:
+        return now_date()
+    try:
+        return parsedate_to_datetime(s).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except Exception:
+        return now_date()
+
+def parse_feed(data):
+    # Handles RSS 2.0 and Atom (incl. YouTube uploads + arXiv API responses).
+    root = ET.fromstring(data)
+    items = []
+    if root.tag == ATOM + "feed":
+        for e in root.findall(ATOM + "entry"):
+            def t(tag):
+                el = e.find(ATOM + tag)
+                return (el.text or "").strip() if el is not None and el.text else ""
+            link = ""
+            for l in e.findall(ATOM + "link"):
+                if l.get("rel", "alternate") == "alternate":
+                    link = l.get("href", "")
+                    break
+            if not link:
+                l = e.find(ATOM + "link")
+                link = l.get("href", "") if l is not None else ""
+            vid = e.find(YTNS + "videoId")
+            desc = e.find(".//" + MRSS + "description")
+            summary = t("summary") or t("content")
+            if not summary and desc is not None and desc.text:
+                summary = desc.text
+            authors = [a.findtext(ATOM + "name", "").strip()
+                       for a in e.findall(ATOM + "author")]
+            cats = [c.get("term", "") for c in e.findall(ATOM + "category")]
+            items.append({
+                "id": t("id") or link,
+                "title": strip_html(t("title")),
+                "url": link,
+                "published": parse_date(t("published") or t("updated")),
+                "summary": clip(strip_html(summary), 1500),
+                "authors": [a for a in authors if a],
+                "tags": [c for c in cats if c],
+                "video_id": vid.text.strip() if vid is not None and vid.text else ""
+            })
+    else:
+        for it in root.iter("item"):
+            def t(tag):
+                el = it.find(tag)
+                return (el.text or "").strip() if el is not None and el.text else ""
+            link = t("link")
+            guid = t("guid") or link
+            items.append({
+                "id": guid,
+                "title": strip_html(t("title")),
+                "url": link,
+                "published": parse_date(t("pubDate") or t("date")),
+                "summary": clip(strip_html(t("description") or t("encoded")), 1500),
+                "authors": [t("creator")] if t("creator") else [],
+                "tags": [],
+                "video_id": ""
+            })
+    return items
+
+# ---------------------------------------------------------------- state + sources
+
+def load_state(home):
+    p = home / "state.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {"seen": {}, "channels": {}}
+
+def save_state(home, state):
+    seen = state.get("seen", {})
+    if len(seen) > SEEN_CAP:
+        keep = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:SEEN_CAP]
+        state["seen"] = dict(keep)
+    (home / "state.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
+
+def resolve_channel(src, state, timeout):
+    cid = src.get("channel_id", "")
+    if cid:
+        return cid
+    handle = src.get("handle", "")
+    if not handle:
+        raise FetchError(f"youtube source '{src.get('name')}' needs channel_id or handle")
+    if handle in state.get("channels", {}):
+        return state["channels"][handle]
+    page = http_get("https://www.youtube.com/" + handle, timeout=timeout).decode("utf-8", "replace")
+    for pat in (r'"channelId":"(UC[0-9A-Za-z_-]{22})"',
+                r'"externalId":"(UC[0-9A-Za-z_-]{22})"',
+                r'youtube\.com/channel/(UC[0-9A-Za-z_-]{22})'):
+        m = re.search(pat, page)
+        if m:
+            state.setdefault("channels", {})[handle] = m.group(1)
+            return m.group(1)
+    raise FetchError(f"could not resolve channel_id for {handle}; set channel_id in config")
+
+def fetch_source(src, state, cfg):
+    kind = src["kind"]
+    timeout = cfg.get("http_timeout_s", 30)
+    if kind == "arxiv":
+        cats = src.get("categories", ["cs.AI", "cs.CL", "cs.LG"])
+        q = " OR ".join("cat:" + c for c in cats)
+        url = ARXIV_API + "?" + urllib.parse.urlencode(
+            {"search_query": q, "sortBy": "submittedDate", "sortOrder": "descending",
+             "max_results": src.get("fetch", 40)})
+        raw = parse_feed(http_get(url, timeout=timeout))
+    elif kind == "youtube":
+        cid = resolve_channel(src, state, timeout)
+        raw = parse_feed(http_get(YT_FEED + cid, timeout=timeout))
+        for it in raw:
+            if it["video_id"]:
+                it["url"] = "https://www.youtube.com/watch?v=" + it["video_id"]
+                it["id"] = "yt:" + it["video_id"]
+    elif kind == "rss":
+        raw = parse_feed(http_get(src["url"], timeout=timeout))
+    else:
+        raise FetchError(f"unknown source kind: {kind}")
+    inc = [re.compile(p, re.I) for p in src.get("include", [])]
+    exc = [re.compile(p, re.I) for p in src.get("exclude", [])]
+    out = []
+    for it in raw:
+        text = (it["title"] or "") + " " + (it["summary"] or "")
+        if inc and not any(p.search(text) for p in inc):
+            continue
+        if any(p.search(text) for p in exc):
+            continue
+        it["source"] = src["name"]
+        it["kind"] = kind
+        it["suggested_tags"] = src.get("tags", []) + (it["tags"] if kind == "arxiv" else [])
+        out.append(it)
+    return out
+
+def select_items(fetched_by_source, state, budget, per_source):
+    seen = state.get("seen", {})
+    chosen, newly = [], []
+    for name, items in fetched_by_source:
+        taken = 0
+        for it in items:
+            if not it["id"] or it["id"] in seen:
+                continue
+            newly.append(it["id"])
+            if taken < per_source and len(chosen) < budget:
+                chosen.append(it)
+                taken += 1
+    return chosen, newly
+
+# ---------------------------------------------------------------- inbox drops
+
+def sanitize_filename(s, limit=110):
+    s = re.sub(r'[:/\\|?*<>"#^\[\]]', " ", s or "")
+    s = re.sub(r"\s+", " ", s).strip().rstrip(".")
+    return clip(s, limit)
+
+def render_drop(it):
+    tags = ", ".join(dict.fromkeys(it.get("suggested_tags", [])))
+    authors = ", ".join(it.get("authors", [])[:12])
+    lines = [FM,
+             "source_url: " + it["url"],
+             "source_kind: " + it["kind"],
+             "source_name: " + json.dumps(it["source"]),
+             "published: " + it["published"],
+             "retrieved: " + now_date(),
+             "suggested_tags: [" + tags + "]"]
+    if it["kind"] == "youtube":
+        lines.append("coverage_hint: competitor-coverage")
+    if authors:
+        lines.append("authors: " + json.dumps(authors))
+    lines += [FM, "# " + it["title"], "",
+              "- Source: " + it["source"] + " (" + it["kind"] + ")",
+              "- URL: " + it["url"],
+              "- Published: " + it["published"]]
+    if authors:
+        lines.append("- Authors: " + authors)
+    if it.get("summary"):
+        lines += ["", "## Abstract / description", it["summary"]]
+    lines += ["", "## Librarian instructions",
+              "Process per CLAUDE.md section 6 (Raw copy, Summary, ripple, opportunity check).",
+              "If coverage_hint is competitor-coverage, also apply section 8 (creator rules).", ""]
+    return "\n".join(lines)
+
+def write_drops(vault, items):
+    inbox = vault / "Inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for it in items:
+        base = sanitize_filename(f"{it['published']} - {it['source']} - {it['title']}")
+        p = inbox / (base + ".md")
+        if p.exists():
+            suffix = re.sub(r"\W+", "", it["id"])[-8:] or str(len(paths))
+            p = inbox / (base + " (" + suffix + ").md")
+        p.write_text(render_drop(it), encoding="utf-8")
+        paths.append(p)
+    return paths
+
+# ---------------------------------------------------------------- locking
+
+class Lock:
+    def __init__(self, home, stale_s=3600):
+        self.path = home / "agent.lock"
+        self.stale_s = stale_s
+    def __enter__(self):
+        if self.path.exists():
+            age = time.time() - self.path.stat().st_mtime
+            if age < self.stale_s:
+                raise RuntimeError(f"another run is active (lock age {int(age)}s): {self.path}")
+            LOG.warning("breaking stale lock (%ds old)", int(age))
+            self.path.unlink()
+        fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return self
+    def __exit__(self, *exc):
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+# ---------------------------------------------------------------- git + commands
+
+def git_available():
+    return shutil.which("git") is not None
+
+def git_run(vault, *args):
+    return subprocess.run(["git", "-C", str(vault), *args],
+                          capture_output=True, text=True)
+
+def git_commit(vault, msg, enabled):
+    if not enabled or not git_available() or not (vault / ".git").exists():
+        return False
+    if not git_run(vault, "status", "--porcelain").stdout.strip():
+        return False
+    git_run(vault, "add", "-A")
+    r = git_run(vault, "commit", "-m", msg)
+    return r.returncode == 0
+
+def run_cmd_logged(cmd, cwd, log_path, timeout):
+    with open(log_path, "w", encoding="utf-8") as f:
+        try:
+            r = subprocess.run(cmd, cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT,
+                               timeout=timeout)
+            return r.returncode
+        except subprocess.TimeoutExpired:
+            f.write(f"\n[research_agent] TIMEOUT after {timeout}s\n")
+            return -1
+        except FileNotFoundError:
+            f.write(f"\n[research_agent] command not found: {cmd[0]}\n")
+            return -2
+
+def notify(cfg, text):
+    n = cfg.get("notify", {})
+    url = n.get("webhook_url")
+    if not url:
+        return
+    key = "content" if n.get("style") == "discord" else "text"
+    try:
+        req = urllib.request.Request(url, data=json.dumps({key: text}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        LOG.warning("notify failed: %s", e)
+
+# ---------------------------------------------------------------- orchestration
+
+def orchestrate(cfg, home, args):
+    vault = (home / cfg["vault"]).resolve()
+    if not (vault / "CLAUDE.md").exists():
+        raise SystemExit(f"vault not found or missing CLAUDE.md: {vault}")
+    logs = home / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    state = load_state(home)
+    report = {"started": stamp(), "vault": str(vault), "fetched": {},
+              "dropped": [], "errors": [], "librarian": None, "sync": None}
+
+    if not args.librarian_only:
+        sources = sorted(cfg["sources"], key=lambda s: s.get("priority", 99))
+        fetched = []
+        for src in sources:
+            try:
+                items = fetch_source(src, state, cfg)
+                fetched.append((src["name"], items))
+                report["fetched"][src["name"]] = len(items)
+                LOG.info("fetched %d items from %s", len(items), src["name"])
+            except Exception as e:
+                report["errors"].append(f"{src['name']}: {e}")
+                LOG.warning("source failed: %s: %s", src["name"], e)
+            time.sleep(cfg.get("polite_delay_s", 1.0))
+        budget = args.budget if args.budget is not None else cfg.get("budget_per_run", 12)
+        per_src = args.max_per_source if args.max_per_source is not None else cfg.get("max_per_source", 5)
+        chosen, newly = select_items(fetched, state, budget, per_src)
+        LOG.info("selected %d new items (%d unseen total)", len(chosen), len(newly))
+        if args.dry_run:
+            for it in chosen:
+                LOG.info("[dry-run] would drop: %s | %s", it["source"], it["title"])
+            report["dry_run"] = True
+            report["would_drop"] = [it["title"] for it in chosen]
+        else:
+            paths = write_drops(vault, chosen)
+            report["dropped"] = [str(p.relative_to(vault)) for p in paths]
+            ts = now_date()
+            for iid in newly:
+                state["seen"].setdefault(iid, ts)
+            save_state(home, state)
+            if git_commit(vault, f"research agent: {len(paths)} inbox drops",
+                          cfg.get("git", {}).get("auto_commit", True)):
+                LOG.info("git: committed inbox drops")
+
+    if not args.fetch_only and not args.dry_run and cfg.get("librarian", {}).get("enabled", True):
+        lib = cfg["librarian"]
+        log_path = logs / f"librarian-{stamp()}.log"
+        rc = run_cmd_logged(lib["command"], vault, log_path, lib.get("timeout_s", 900))
+        report["librarian"] = {"returncode": rc, "log": str(log_path)}
+        LOG.info("librarian exit=%s log=%s", rc, log_path)
+        if rc == 0:
+            if git_commit(vault, "librarian: processed inbox",
+                          cfg.get("git", {}).get("auto_commit", True)):
+                LOG.info("git: committed librarian changes")
+            sync_cmd = cfg.get("sync", {}).get("command")
+            if sync_cmd:
+                slog = logs / f"sync-{stamp()}.log"
+                src_rc = run_cmd_logged(sync_cmd, home, slog, 600)
+                report["sync"] = {"returncode": src_rc, "log": str(slog)}
+                LOG.info("sync hook exit=%s", src_rc)
+        else:
+            report["errors"].append(f"librarian exited {rc}; drops remain in Inbox for next run")
+
+    report["finished"] = stamp()
+    rp = logs / f"run-{report['started']}.json"
+    rp.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    summary = (f"CortexOS Research Agent: {len(report['dropped'])} drops, "
+               f"{len(report['errors'])} errors, librarian={report['librarian']}")
+    notify(cfg, summary)
+    LOG.info("report: %s", rp)
+    return report
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="CortexOS Research Agent: feeds -> Inbox -> Librarian -> sync hook")
+    ap.add_argument("--config", default="sources.json")
+    ap.add_argument("--init", action="store_true", help="write example sources.json next to you")
+    ap.add_argument("--fetch-only", action="store_true", help="fetch + drop, skip Librarian")
+    ap.add_argument("--librarian-only", action="store_true", help="skip fetching, just run Librarian + sync")
+    ap.add_argument("--dry-run", action="store_true", help="show what would be dropped; no writes")
+    ap.add_argument("--budget", type=int, default=None)
+    ap.add_argument("--max-per-source", type=int, default=None)
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    cfg_path = Path(args.config).resolve()
+    if args.init:
+        if cfg_path.exists():
+            raise SystemExit(f"refusing to overwrite {cfg_path}")
+        cfg_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+        print(f"wrote {cfg_path} - edit vault path and sources, then run without --init")
+        return 0
+    if not cfg_path.exists():
+        raise SystemExit(f"config not found: {cfg_path} (run with --init first)")
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    home = cfg_path.parent
+    with Lock(home):
+        orchestrate(cfg, home, args)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## Setup
+
+```bash
+mkdir CortexResearch && cd CortexResearch   # sibling of CortexVault
+# save research_agent.py here
+python research_agent.py --init             # writes sources.json
+python research_agent.py --dry-run          # preview first drops, write nothing
+python research_agent.py                    # full run: fetch -> drop -> Librarian -> hook
+```
+
+`sources.json` is the file you'll actually edit — add competitor channels (just a handle, no API key), swap arXiv categories, add feeds, tune `include`/`exclude` regexes per source. The agent lives *outside* the vault so the Librarian never ingests its own machinery; `state.json`, `agent.lock`, and `logs/` stay in `CortexResearch/`.
+
+**Schedule:**
+
+```bash
+# macOS/Linux: full run 06:30, cheap fetch-only top-up at 14:00
+30 6 * * * cd /path/CortexResearch && python3 research_agent.py >> logs/cron.log 2>&1
+0 14 * * * cd /path/CortexResearch && python3 research_agent.py --fetch-only >> logs/cron.log 2>&1
+```
+
+```
+:: Windows
+schtasks /Create /TN "CortexResearch" /SC DAILY /ST 06:30 /TR "python C:\path\CortexResearch\research_agent.py --config C:\path\CortexResearch\sources.json"
+```
+
+## Verified in the sandbox
+
+- Parsers: RSS 2.0, arXiv Atom (authors + categories), YouTube Atom (`videoId`, `media:description`) ✅
+- Drops: sanitized filenames, valid YAML frontmatter, `coverage_hint` for competitor videos ✅
+- Three consecutive runs: **4 drops → 0 re-drops → exactly 1 new item** ✅
+- Handle → channel-ID resolution cached in `state.json` ✅
+- Git: real `git log` shows `research agent: N inbox drops` then `librarian: processed inbox` ✅
+- Lock blocks concurrent runs and breaks stale locks; dry-run writes nothing; `--init` produces valid config ✅
+
+## Design decisions worth knowing
+
+- **Flood control:** first run drops only the newest `max_per_source` items per feed and marks the rest seen — you won't wake up to 200 arXiv papers in Inbox. Global `budget_per_run: 12` bounds Librarian cost per day.
+- **Competitor uploads need no YouTube API:** every channel has a public Atom feed (`feeds/videos.xml?channel_id=...`). The agent resolves `@handle → UC…` once and caches it. If YouTube ever blocks the resolver, paste `channel_id` into the config (channel page → view source → search `channelId`).
+- **Failure is boring:** a dead feed is logged and skipped; a failed/timed-out Librarian leaves the drops committed in Inbox for the next run. Nothing is lost, nothing is retried into a loop.
+- **Two commits per run** = clean review boundaries: `git show` the drops commit to see what arrived, the librarian commit to see what the agent did with it.
+- **The drops speak the rulebook's language:** `suggested_tags`, `coverage_hint: competitor-coverage`, and explicit pointers to CLAUDE.md §6/§8 — so competitor videos automatically flow into the trend-gap logic on your Home dashboard.
+
+Next slice is the one this hook is waiting for: **the sync engine** — vault parser (frontmatter + wikilinks → nodes/edges), Postgres + pgvector schema, hash-based incremental upserts, and the hybrid retrieval endpoint. Say the word and I'll ship it the same way: complete code, tested before delivery.
+
+Word received — shipping it. One transparency note first: **my code sandbox isn't available in this session**, so unlike the last two slices I couldn't execute this before delivery. To hold the same bar, the engine ships with a `--self-test` suite containing exactly the checks I would have run (parser, redirect resolution, incremental hashing, chunk-reuse, search ranking, live HTTP), runnable in ~2 seconds with zero infrastructure. I've desk-checked the SQL and the tricky paths (YAML date serialization, generated-column immutability, pgvector param casting). If any check fails on your machine, paste the output and I'll fix it immediately.
+
+Architecture decision that keeps this slice honest and testable: **two stores behind one interface.** `MemoryStore` (JSON file) makes the whole pipeline runnable today with no Postgres — and is what the self-test exercises end-to-end. `PgStore` is the production path with the real schema. Retrieval fusion (RRF + graph expansion + recency) is shared pure Python, so both stores rank identically.
+
+```
+vault/*.md ──parse──► nodes + edges + chunks
+                        │  sha256 per file → upsert only what changed
+                        │  sha256 per chunk → re-embed only new chunks
+                        ▼
+        MemoryStore (store.json)  │  PgStore (Postgres + pgvector)
+                        ▼
+   hybrid retrieval: websearch FTS + cosine + 1–2 hop graph + recency, RRF-fused
+                        ▼
+        GET /search  /node  /graph  /health   (stdlib HTTP, XYFlow-ready)
+```
+
+## `CortexEngine/cortex_sync.py`
+
+```python
+#!/usr/bin/env python3
+# CortexOS Sync Engine - Phase 1, slice 1
+# Vault markdown -> nodes/edges/chunks -> MemoryStore (JSON) or Postgres + pgvector.
+# Deps: pyyaml (always); psycopg[binary] (only for --store pg).
+# Verify install: python cortex_sync.py --self-test
+
+import os, re, sys, json, time, math, hashlib, logging, argparse
+from pathlib import Path
+from datetime import datetime, timezone
+import urllib.request
+import yaml
+
+LOG = logging.getLogger("cortex_sync")
+FM = "-" * 3
+FENCE = chr(96) * 3
+DIM = 1536
+INDEX_DIRS = ("Wiki", "Doctrine", "Armory", "Raw")   # Inbox/system zones are not knowledge yet
+LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+FENCE_RE = re.compile(re.escape(FENCE) + r".*?" + re.escape(FENCE), re.S)
+H1_RE = re.compile(r"^#\s+(.+)$", re.M)
+
+SCHEMA = '''
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS meta (key text PRIMARY KEY, value text);
+CREATE TABLE IF NOT EXISTS nodes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  path text UNIQUE NOT NULL,
+  type text NOT NULL,
+  title text NOT NULL,
+  props jsonb NOT NULL DEFAULT '{}',
+  body text NOT NULL DEFAULT '',
+  redirect boolean NOT NULL DEFAULT false,
+  updated date,
+  hash text NOT NULL,
+  synced_at timestamptz NOT NULL DEFAULT now(),
+  search tsvector GENERATED ALWAYS AS (
+    to_tsvector('english', coalesce(title, '') || ' ' ||
+                coalesce(props->>'aliases', '') || ' ' || coalesce(body, ''))
+  ) STORED
+);
+CREATE INDEX IF NOT EXISTS nodes_search_idx ON nodes USING gin (search);
+CREATE INDEX IF NOT EXISTS nodes_type_idx ON nodes (type);
+CREATE TABLE IF NOT EXISTS edges (
+  src uuid REFERENCES nodes(id) ON DELETE CASCADE,
+  dst uuid REFERENCES nodes(id) ON DELETE CASCADE,
+  kind text NOT NULL DEFAULT 'REFERENCES',
+  context text NOT NULL DEFAULT '',
+  PRIMARY KEY (src, dst, kind)
+);
+CREATE TABLE IF NOT EXISTS chunks (
+  id bigserial PRIMARY KEY,
+  node_id uuid REFERENCES nodes(id) ON DELETE CASCADE,
+  ord int NOT NULL,
+  text text NOT NULL,
+  hash text NOT NULL,
+  embedding vector(1536),
+  UNIQUE (node_id, ord)
+);
+CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks USING hnsw (embedding vector_cosine_ops);
+'''
+
+# ---------------------------------------------------------------- parsing
+
+def sha(s):
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+def split_frontmatter(text):
+    if text.startswith(FM + "\n"):
+        end = text.find("\n" + FM, 4)
+        if end != -1:
+            try:
+                props = yaml.safe_load(text[4:end]) or {}
+                if not isinstance(props, dict):
+                    props = {}
+            except Exception:
+                props = {"parse_error": True}
+            return props, text[end + len(FM) + 1:].lstrip("\n")
+    return {}, text
+
+def norm_name(s):
+    return re.sub(r"\s+", " ", str(s).strip()).lower()
+
+def infer_type(rel, props):
+    if props.get("type"):
+        return str(props["type"])
+    parts = Path(rel).parts
+    if parts[0] == "Raw":
+        return "raw"
+    if parts[0] == "Doctrine":
+        return "doctrine"
+    if parts[0] == "Armory":
+        return "idea"
+    if len(parts) > 1:
+        return {"Concepts": "concept", "Entities": "entity",
+                "Summaries": "summary"}.get(parts[1], "note")
+    return "note"
+
+def edge_kind(st, dt):
+    if st == "summary":
+        return "MENTIONS"
+    if st == "entity" and dt == "entity":
+        return "RELATED_TO"
+    return "REFERENCES"
+
+def parse_vault(vault):
+    vault = Path(vault)
+    files = []
+    for d in INDEX_DIRS:
+        base = vault / d
+        if base.exists():
+            files.extend(sorted(base.rglob("*.md")))
+    nodes, errors = {}, []
+    for p in files:
+        rel = p.relative_to(vault).as_posix()
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception as e:
+            errors.append(f"{rel}: {e}")
+            continue
+        props, body = split_frontmatter(text)
+        h1 = H1_RE.search(body)
+        tags = [str(t).lower() for t in as_list(props.get("tags"))]
+        nodes[rel] = {
+            "path": rel,
+            "title": h1.group(1).strip() if h1 else p.stem,
+            "type": infer_type(rel, props),
+            "props": props,
+            "body": body,
+            "links": [m.group(1).strip() for m in LINK_RE.finditer(FENCE_RE.sub("", text))],
+            "redirect": "redirect" in tags,
+            "updated": str(props.get("updated") or props.get("created") or
+                           datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d")),
+            "hash": sha(text),
+        }
+    by_name = {}
+    for rel, n in nodes.items():
+        by_name.setdefault(norm_name(Path(rel).stem), rel)
+        for a in as_list(n["props"].get("aliases")):
+            by_name.setdefault(norm_name(a), rel)
+
+    def resolve(target, depth=0):
+        rel = by_name.get(norm_name(target))
+        if rel and nodes[rel]["redirect"] and depth < 5:
+            m = LINK_RE.search(FENCE_RE.sub("", nodes[rel]["body"]))
+            if m:
+                return resolve(m.group(1).strip(), depth + 1)
+        return rel
+
+    edges, dangling = [], set()
+    for rel, n in nodes.items():
+        if n["redirect"]:
+            continue
+        seen = set()
+        for t in n["links"]:
+            dst = resolve(t)
+            if not dst:
+                dangling.add(t)
+                continue
+            if dst == rel or nodes[dst]["redirect"]:
+                continue
+            kind = edge_kind(n["type"], nodes[dst]["type"])
+            if (dst, kind) in seen:
+                continue
+            seen.add((dst, kind))
+            ctx = next((ln.strip()[:200] for ln in n["body"].splitlines()
+                        if "[[" + t in ln), "")
+            edges.append({"src": rel, "dst": dst, "kind": kind, "context": ctx})
+    return nodes, edges, {"dangling": sorted(dangling), "errors": errors}
+
+def chunk_body(title, body, target=900):
+    paras = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    chunks, cur = [], ""
+    for p in paras:
+        if len(p) > target:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.extend(p[i:i + target] for i in range(0, len(p), target))
+        elif len(cur) + len(p) + 2 > target:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = (cur + "\n\n" + p) if cur else p
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        chunks = [title]
+    return [{"ord": i, "text": c, "hash": sha(c), "embed_input": title + "\n" + c}
+            for i, c in enumerate(chunks)]
+
+# ---------------------------------------------------------------- embedders
+
+class HashEmbedder:
+    # Deterministic feature hashing. Lexical, NOT semantic - zero-infra fallback.
+    name, model, dim = "hash", "feature-hash-v1", DIM
+    def embed(self, texts):
+        out = []
+        for t in texts:
+            v = [0.0] * DIM
+            toks = re.findall(r"[a-z0-9]+", t.lower())
+            for g in toks + ["_".join(p) for p in zip(toks, toks[1:])]:
+                idx = int.from_bytes(hashlib.blake2b(g.encode(), digest_size=8).digest(), "big") % DIM
+                v[idx] += 1.0
+            n = math.sqrt(sum(x * x for x in v)) or 1.0
+            out.append([x / n for x in v])
+        return out
+
+class OpenAIEmbedder:
+    name, model, dim = "openai", "text-embedding-3-small", DIM
+    def __init__(self, key=None):
+        self.key = key or os.environ.get("OPENAI_API_KEY")
+        if not self.key:
+            raise SystemExit("OPENAI_API_KEY not set")
+    def embed(self, texts):
+        out = []
+        for i in range(0, len(texts), 64):
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/embeddings",
+                data=json.dumps({"model": self.model, "input": texts[i:i + 64]}).encode(),
+                headers={"Authorization": "Bearer " + self.key,
+                         "Content-Type": "application/json"})
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        data = json.loads(r.read())
+                    out.extend(d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"]))
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 * (attempt + 1))
+        return out
+
+def make_embedder(choice):
+    if choice == "hash":
+        return HashEmbedder()
+    if choice == "openai":
+        return OpenAIEmbedder()
+    if os.environ.get("OPENAI_API_KEY"):
+        return OpenAIEmbedder()
+    LOG.warning("no OPENAI_API_KEY; using hash embedder (lexical, not semantic)")
+    return HashEmbedder()
+
+# ---------------------------------------------------------------- retrieval fusion
+
+def recency_boost(updated):
+    try:
+        d = datetime.strptime(str(updated)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        age = max(0.0, (datetime.now(timezone.utc) - d).days)
+        return 1.0 + 0.25 * math.exp(-age / 30.0)
+    except Exception:
+        return 1.0
+
+def hybrid_search(store, embedder, q, k=10, type_filter=None, hops=1):
+    kw = store.keyword_search(q, 30)
+    sem = store.vector_search(embedder.embed([q])[0], 30)
+    scores, via, snips = {}, {}, {}
+    for label, rows in (("keyword", kw), ("semantic", sem)):
+        for rank, row in enumerate(rows, 1):          # reciprocal rank fusion, k=60
+            p = row[0]
+            scores[p] = scores.get(p, 0.0) + 1.0 / (60 + rank)
+            via.setdefault(p, []).append(label)
+    for row in sem:
+        if len(row) > 2 and row[2]:
+            snips[row[0]] = row[2]
+    seeds = sorted(scores, key=scores.get, reverse=True)[:8]
+    for p, hop, seed in store.neighborhood(seeds, hops):
+        if p in scores:
+            continue
+        scores[p] = scores.get(seed, 0.0) * (0.5 ** hop) * 0.6
+        via[p] = ["graph"]
+    nodes = store.get_nodes(list(scores))
+    out = []
+    for p, s in scores.items():
+        n = nodes.get(p)
+        if not n or n["redirect"]:
+            continue
+        if type_filter and n["type"] != type_filter:
+            continue
+        out.append({"path": p, "title": n["title"], "type": n["type"],
+                    "score": round(s * recency_boost(n["updated"]), 6),
+                    "via": via.get(p, []), "updated": n["updated"],
+                    "snippet": snips.get(p) or (n.get("body") or "")[:240]})
+    out.sort(key=lambda r: -r["score"])
+    return out[:k]
+
+# ---------------------------------------------------------------- stores
+
+class StoreBase:
+    def neighborhood(self, seeds, hops):
+        seeds = [s for s in seeds if s]
+        visited = set(seeds)
+        frontier = {s: s for s in seeds}
+        out = []
+        for hop in range(1, hops + 1):
+            adj = self.adjacent(list(frontier))
+            nxt = {}
+            for node, seed in frontier.items():
+                for nb in adj.get(node, ()):
+                    if nb in visited:
+                        continue
+                    visited.add(nb)
+                    out.append((nb, hop, seed))
+                    nxt[nb] = seed
+            frontier = nxt
+            if not frontier:
+                break
+        return out
+    def save(self):
+        pass
+    def close(self):
+        pass
+
+class MemoryStore(StoreBase):
+    # JSON-file store: zero-infrastructure mode, and the self-test target.
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {"nodes": {}, "edges": [], "chunks": {}, "meta": {}}
+        self._mtime = 0
+        if self.path.exists():
+            self.reload()
+    def reload(self):
+        self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        self._mtime = self.path.stat().st_mtime
+    def maybe_reload(self):
+        try:
+            if self.path.stat().st_mtime != self._mtime:
+                self.reload()
+        except FileNotFoundError:
+            pass
+    def save(self):
+        self.path.write_text(json.dumps(self.data, default=str), encoding="utf-8")
+        self._mtime = self.path.stat().st_mtime
+    def init(self):
+        pass
+    def meta(self):
+        return self.data["meta"]
+    def set_meta(self, m):
+        self.data["meta"].update(m)
+    def hashes(self):
+        return {p: n["hash"] for p, n in self.data["nodes"].items()}
+    def ids(self):
+        return {p: p for p in self.data["nodes"]}
+    def upsert_node(self, n):
+        self.data["nodes"][n["path"]] = {k: n[k] for k in
+            ("path", "title", "type", "props", "body", "redirect", "updated", "hash")}
+    def delete_nodes(self, paths):
+        ps = set(paths)
+        for p in ps:
+            self.data["nodes"].pop(p, None)
+            self.data["chunks"].pop(p, None)
+        self.data["edges"] = [e for e in self.data["edges"]
+                              if e["src"] not in ps and e["dst"] not in ps]
+    def set_edges(self, src, edges, ids):
+        self.data["edges"] = [e for e in self.data["edges"] if e["src"] != src] + edges
+    def get_chunks(self, path):
+        return self.data["chunks"].get(path, [])
+    def set_chunks(self, path, chunks):
+        self.data["chunks"][path] = chunks
+    def keyword_search(self, q, limit):
+        toks = set(re.findall(r"[a-z0-9]+", q.lower()))
+        if not toks:
+            return []
+        scored = []
+        for p, n in self.data["nodes"].items():
+            if n["redirect"]:
+                continue
+            aliases = " ".join(str(a) for a in as_list(n["props"].get("aliases")))
+            text = (n["title"] + " " + aliases + " " + n["body"]).lower()
+            hits = sum(text.count(t) for t in toks)
+            if hits:
+                scored.append((p, float(hits)))
+        scored.sort(key=lambda r: -r[1])
+        return scored[:limit]
+    def vector_search(self, qv, limit):
+        best = {}
+        for p, chunks in self.data["chunks"].items():
+            n = self.data["nodes"].get(p)
+            if not n or n["redirect"]:
+                continue
+            for c in chunks:
+                v = c.get("vec")
+                if not v:
+                    continue
+                s = sum(a * b for a, b in zip(qv, v))
+                if p not in best or s > best[p][0]:
+                    best[p] = (s, c["text"][:240])
+        rows = [(p, s, sn) for p, (s, sn) in best.items()]
+        rows.sort(key=lambda r: -r[1])
+        return rows[:limit]
+    def adjacent(self, paths):
+        ps = set(paths)
+        out = {p: set() for p in paths}
+        for e in self.data["edges"]:
+            a, b = e["src"], e["dst"]
+            if a in ps and not self.data["nodes"].get(b, {}).get("redirect"):
+                out[a].add(b)
+            if b in ps and not self.data["nodes"].get(a, {}).get("redirect"):
+                out[b].add(a)
+        return {p: sorted(v) for p, v in out.items()}
+    def get_nodes(self, paths):
+        return {p: self.data["nodes"][p] for p in paths if p in self.data["nodes"]}
+    def graph(self, paths):
+        ps = set(paths)
+        return [e for e in self.data["edges"] if e["src"] in ps and e["dst"] in ps
+                and not self.data["nodes"].get(e["src"], {}).get("redirect")
+                and not self.data["nodes"].get(e["dst"], {}).get("redirect")]
+    def graph_for(self, path):
+        return [e for e in self.data["edges"] if e["src"] == path or e["dst"] == path]
+    def stats(self):
+        types = {}
+        for n in self.data["nodes"].values():
+            types[n["type"]] = types.get(n["type"], 0) + 1
+        return {"nodes": len(self.data["nodes"]), "edges": len(self.data["edges"]),
+                "chunks": sum(len(c) for c in self.data["chunks"].values()),
+                "types": types, "meta": self.data["meta"]}
+
+class PgStore(StoreBase):
+    # Production store: Postgres 14+ with pgvector. pip install "psycopg[binary]"
+    def __init__(self, url):
+        try:
+            import psycopg
+        except ImportError:
+            raise SystemExit('psycopg missing: pip install "psycopg[binary]"')
+        self.conn = psycopg.connect(url, autocommit=True)
+    def init(self):
+        self.conn.execute(SCHEMA)
+    def meta(self):
+        return dict(self.conn.execute("SELECT key, value FROM meta").fetchall())
+    def set_meta(self, m):
+        for k, v in m.items():
+            self.conn.execute("INSERT INTO meta(key, value) VALUES(%s, %s) "
+                              "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (k, str(v)))
+    def hashes(self):
+        return dict(self.conn.execute("SELECT path, hash FROM nodes").fetchall())
+    def ids(self):
+        return dict(self.conn.execute("SELECT path, id::text FROM nodes").fetchall())
+    def upsert_node(self, n):
+        upd = str(n["updated"])[:10]
+        try:
+            datetime.strptime(upd, "%Y-%m-%d")
+        except Exception:
+            upd = None
+        self.conn.execute(
+            "INSERT INTO nodes(path, type, title, props, body, redirect, updated, hash) "
+            "VALUES(%s, %s, %s, %s::jsonb, %s, %s, %s::date, %s) "
+            "ON CONFLICT (path) DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title, "
+            "props = EXCLUDED.props, body = EXCLUDED.body, redirect = EXCLUDED.redirect, "
+            "updated = EXCLUDED.updated, hash = EXCLUDED.hash, synced_at = now()",
+            (n["path"], n["type"], n["title"], json.dumps(n["props"], default=str),
+             n["body"], n["redirect"], upd, n["hash"]))
+    def delete_nodes(self, paths):
+        if paths:
+            self.conn.execute("DELETE FROM nodes WHERE path = ANY(%s)", (list(paths),))
+    def set_edges(self, src, edges, ids):
+        sid = ids.get(src)
+        if not sid:
+            return
+        self.conn.execute("DELETE FROM edges WHERE src = %s::uuid", (sid,))
+        for e in edges:
+            did = ids.get(e["dst"])
+            if did:
+                self.conn.execute("INSERT INTO edges(src, dst, kind, context) "
+                                  "VALUES(%s::uuid, %s::uuid, %s, %s) "
+                                  "ON CONFLICT DO NOTHING",
+                                  (sid, did, e["kind"], e.get("context", "")))
+    def get_chunks(self, path):
+        rows = self.conn.execute(
+            "SELECT c.ord, c.text, c.hash, c.embedding::text FROM chunks c "
+            "JOIN nodes n ON n.id = c.node_id WHERE n.path = %s ORDER BY c.ord", (path,)).fetchall()
+        return [{"ord": r[0], "text": r[1], "hash": r[2],
+                 "vec": json.loads(r[3]) if r[3] else None} for r in rows]
+    def set_chunks(self, path, chunks):
+        nid = self.ids().get(path)
+        if not nid:
+            return
+        self.conn.execute("DELETE FROM chunks WHERE node_id = %s::uuid", (nid,))
+        for c in chunks:
+            self.conn.execute("INSERT INTO chunks(node_id, ord, text, hash, embedding) "
+                              "VALUES(%s::uuid, %s, %s, %s, %s::vector)",
+                              (nid, c["ord"], c["text"], c["hash"],
+                               json.dumps(c["vec"]) if c.get("vec") is not None else None))
+    def keyword_search(self, q, limit):
+        if not q.strip():
+            return []
+        rows = self.conn.execute(
+            "SELECT path, ts_rank(search, q) AS score FROM nodes, "
+            "websearch_to_tsquery('english', %s) AS q "
+            "WHERE search @@ q AND NOT redirect ORDER BY score DESC LIMIT %s", (q, limit)).fetchall()
+        return [(r[0], float(r[1])) for r in rows]
+    def vector_search(self, qv, limit):
+        vec = json.dumps(qv)
+        rows = self.conn.execute(
+            "SELECT n.path, 1 - (c.embedding <=> %s::vector) AS score, left(c.text, 240) "
+            "FROM chunks c JOIN nodes n ON n.id = c.node_id "
+            "WHERE NOT n.redirect AND c.embedding IS NOT NULL "
+            "ORDER BY c.embedding <=> %s::vector LIMIT %s", (vec, vec, limit * 3)).fetchall()
+        best = {}
+        for p, s, sn in rows:
+            if p not in best or s > best[p][0]:
+                best[p] = (float(s), sn)
+        out = [(p, s, sn) for p, (s, sn) in best.items()]
+        out.sort(key=lambda r: -r[1])
+        return out[:limit]
+    def adjacent(self, paths):
+        if not paths:
+            return {}
+        rows = self.conn.execute(
+            "SELECT s.path, d.path FROM edges e "
+            "JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+            "WHERE (s.path = ANY(%s) OR d.path = ANY(%s)) "
+            "AND NOT s.redirect AND NOT d.redirect", (paths, paths)).fetchall()
+        out = {p: set() for p in paths}
+        for a, b in rows:
+            if a in out:
+                out[a].add(b)
+            if b in out:
+                out[b].add(a)
+        return {p: sorted(v) for p, v in out.items()}
+    def get_nodes(self, paths):
+        if not paths:
+            return {}
+        rows = self.conn.execute(
+            "SELECT path, title, type, props, redirect, updated::text, body "
+            "FROM nodes WHERE path = ANY(%s)", (list(paths),)).fetchall()
+        return {r[0]: {"path": r[0], "title": r[1], "type": r[2], "props": r[3],
+                       "redirect": r[4], "updated": r[5], "body": r[6]} for r in rows}
+    def graph(self, paths):
+        if not paths:
+            return []
+        rows = self.conn.execute(
+            "SELECT s.path, d.path, e.kind FROM edges e "
+            "JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+            "WHERE s.path = ANY(%s) AND d.path = ANY(%s) "
+            "AND NOT s.redirect AND NOT d.redirect", (list(paths), list(paths))).fetchall()
+        return [{"src": r[0], "dst": r[1], "kind": r[2]} for r in rows]
+    def graph_for(self, path):
+        rows = self.conn.execute(
+            "SELECT s.path, d.path, e.kind FROM edges e "
+            "JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+            "WHERE s.path = %s OR d.path = %s", (path, path)).fetchall()
+        return [{"src": r[0], "dst": r[1], "kind": r[2]} for r in rows]
+    def stats(self):
+        n = self.conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        e = self.conn.execute("SELECT count(*) FROM edges").fetchone()[0]
+        c = self.conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        types = dict(self.conn.execute("SELECT type, count(*) FROM nodes GROUP BY type").fetchall())
+        return {"nodes": n, "edges": e, "chunks": c, "types": types, "meta": self.meta()}
+    def close(self):
+        self.conn.close()
+
+def make_store(args):
+    if args.store == "pg":
+        url = args.db or os.environ.get("DATABASE_URL")
+        if not url:
+            raise SystemExit("--store pg needs --db or DATABASE_URL")
+        return PgStore(url)
+    return MemoryStore(args.state)
+
+# ---------------------------------------------------------------- sync engine
+
+def sync(vault, store, embedder, full=False, no_embed=False):
+    t0 = time.time()
+    nodes, edges, issues = parse_vault(vault)
+    store.init()
+    ident = {"embedder": embedder.name, "model": embedder.model, "dim": str(embedder.dim)}
+    m = store.meta()
+    if m.get("embedder") and any(m.get(k) != v for k, v in ident.items()) and not full:
+        raise SystemExit(f"embedder changed ({m.get('embedder')} -> {embedder.name}); "
+                         "run with --full to re-embed everything")
+    store.set_meta(ident)
+    old = store.hashes()
+    changed = [p for p, n in nodes.items() if full or old.get(p) != n["hash"]]
+    deleted = [p for p in old if p not in nodes]
+    store.delete_nodes(deleted)
+    for p in changed:
+        store.upsert_node(nodes[p])
+    ids = store.ids()
+    by_src = {}
+    for e in edges:
+        by_src.setdefault(e["src"], []).append(e)
+    for p in changed:
+        store.set_edges(p, by_src.get(p, []), ids)
+    emb_new = emb_reused = 0
+    for p in changed:
+        n = nodes[p]
+        if n["redirect"]:
+            store.set_chunks(p, [])
+            continue
+        new_chunks = chunk_body(n["title"], n["body"])
+        old_chunks = {c["hash"]: c for c in store.get_chunks(p)}
+        todo = []
+        for c in new_chunks:
+            oc = old_chunks.get(c["hash"])
+            c["vec"] = oc.get("vec") if oc else None
+            if c["vec"] is None:
+                todo.append(c)
+            else:
+                emb_reused += 1
+        if todo and not no_embed:
+            for c, v in zip(todo, embedder.embed([c["embed_input"] for c in todo])):
+                c["vec"] = v
+            emb_new += len(todo)
+        for c in new_chunks:
+            c.pop("embed_input", None)
+        store.set_chunks(p, new_chunks)
+    store.set_meta({"last_sync": datetime.now(timezone.utc).isoformat()})
+    store.save()
+    return {"scanned": len(nodes), "upserted": len(changed), "deleted": len(deleted),
+            "edges": len(edges), "embedded": emb_new, "reused": emb_reused,
+            "dangling": issues["dangling"], "errors": issues["errors"],
+            "seconds": round(time.time() - t0, 2)}
+
+# ---------------------------------------------------------------- self-test
+
+def self_test():
+    import tempfile, threading, traceback
+    from urllib.parse import urlencode
+    passed = []
+    def check(cond, label):
+        if not cond:
+            raise AssertionError(label)
+        passed.append(label)
+        print("PASS", label)
+    try:
+        tmp = Path(tempfile.mkdtemp())
+        vault = tmp / "Vault"
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        def note(rel, fm_extra, body):
+            p = vault / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(FM + "\n" + fm_extra.format(d=today) + "\n" + FM + "\n" + body,
+                         encoding="utf-8")
+        note("Wiki/Concepts/Knowledge Graph.md",
+             "type: concept\naliases: [KG]\ntags: [graph]\ncreated: {d}\nupdated: {d}",
+             "# Knowledge Graph\n\nNodes and edges over knowledge. Links [[CortexOS]] and [[Second Brain]].\n")
+        note("Wiki/Concepts/AI Second Brain.md",
+             "type: concept\naliases: [Second Brain, LLM Wiki]\ntags: [pkm]\ncreated: {d}\nupdated: {d}",
+             "# AI Second Brain\n\nAn LLM-maintained wiki. Uses a [[Knowledge Graph]]. See [[Nonexistent Page]].\n")
+        note("Wiki/Entities/CortexOS.md",
+             "type: entity\nentity_kind: project\naliases: []\ntags: [project]\ncreated: {d}\nupdated: {d}",
+             "# CortexOS\n\nKnowledge OS project. Built on [[Knowledge-Graph]] and [[Obsidian]].\n")
+        note("Wiki/Entities/Obsidian.md",
+             "type: entity\nentity_kind: product\naliases: []\ntags: [tool]\ncreated: {d}\nupdated: {d}",
+             "# Obsidian\n\nMarkdown editor for the [[AI Second Brain]].\n")
+        note("Wiki/Concepts/Knowledge-Graph.md",
+             "type: concept\naliases: []\ntags: [redirect]\ncreated: {d}\nupdated: {d}",
+             "# Knowledge-Graph\n\n> Redirect -> [[Knowledge Graph]]\n")
+        note("Wiki/Summaries/2026-11-16 - Test Video.md",
+             "type: summary\naliases: []\ntags: [video]\ncreated: {d}\nupdated: {d}\nsources: [\"[[Knowledge Graph]]\"]",
+             "# Test Video\n\nCovers [[Knowledge Graph]] and [[CortexOS]].\n")
+        note("Doctrine/Test Doctrine.md",
+             "type: doctrine\naliases: []\ntags: []\ncreated: {d}\nupdated: {d}",
+             "# Test Doctrine\n\nBased on [[2026-11-16 - Test Video]].\n")
+        note("Armory/Test Idea.md",
+             "type: idea\naliases: []\ntags: []\ncreated: {d}\nupdated: {d}\nstatus: idea\nhook: test",
+             "# Test Idea\n\nEvidence: [[2026-11-16 - Test Video]].\n")
+        (vault / "Raw").mkdir(parents=True, exist_ok=True)
+        (vault / "Raw/source.md").write_text("Verbatim source text about graphs.", encoding="utf-8")
+        (vault / "Templates").mkdir(parents=True, exist_ok=True)
+        (vault / "Templates/T.md").write_text("skip me", encoding="utf-8")
+        (vault / "Inbox").mkdir(parents=True, exist_ok=True)
+        (vault / "Inbox/pending.md").write_text("skip me too", encoding="utf-8")
+
+        nodes, edges, issues = parse_vault(vault)
+        check(len(nodes) == 9, "parser: 9 nodes (system zones + Inbox excluded)")
+        check(nodes["Raw/source.md"]["type"] == "raw", "parser: Raw inferred without frontmatter")
+        check(nodes["Wiki/Concepts/Knowledge-Graph.md"]["redirect"], "parser: redirect stub flagged")
+        kg = "Wiki/Concepts/Knowledge Graph.md"
+        co = "Wiki/Entities/CortexOS.md"
+        check(any(e["src"] == co and e["dst"] == kg for e in edges),
+              "parser: link via redirect stub retargeted to canonical")
+        check(any(e["src"] == kg and e["dst"] == "Wiki/Concepts/AI Second Brain.md" for e in edges),
+              "parser: alias link [[Second Brain]] resolved")
+        check(any(e["kind"] == "MENTIONS" for e in edges), "parser: summary edges typed MENTIONS")
+        check("Nonexistent Page" in issues["dangling"], "parser: dangling link reported, no crash")
+
+        ch = chunk_body("T", "para one\n\n" + "x" * 2000 + "\n\npara two")
+        check(all(len(c["text"]) <= 900 for c in ch), "chunker: respects size cap")
+        check(chunk_body("T", "a\n\nb") == chunk_body("T", "a\n\nb"), "chunker: deterministic")
+
+        emb = HashEmbedder()
+        v1, v2 = emb.embed(["knowledge graph nodes edges"])[0], emb.embed(["knowledge graph nodes edges"])[0]
+        check(v1 == v2 and len(v1) == DIM, "embedder: deterministic, dim 1536")
+        check(abs(math.sqrt(sum(x * x for x in v1)) - 1.0) < 1e-9, "embedder: L2 normalized")
+        sim = lambda a, b: sum(x * y for x, y in zip(emb.embed([a])[0], emb.embed([b])[0]))
+        check(sim("knowledge graph", "knowledge graph nodes edges") > sim("banana", "knowledge graph nodes edges"),
+              "embedder: lexical similarity sanity")
+        check(recency_boost(today) > recency_boost("2020-01-01"), "ranking: recency boost decays")
+
+        store = MemoryStore(tmp / "store.json")
+        r1 = sync(vault, store, emb)
+        check(r1["upserted"] == 9 and r1["embedded"] > 0, "sync: first run indexes everything")
+        r2 = sync(vault, store, emb)
+        check(r2["upserted"] == 0 and r2["embedded"] == 0, "sync: unchanged vault is a no-op")
+        p = vault / kg
+        p.write_text(p.read_text(encoding="utf-8") + "\nA brand new paragraph about retrieval.\n", encoding="utf-8")
+        r3 = sync(vault, store, emb)
+        check(r3["upserted"] == 1 and r3["reused"] >= 1 and r3["embedded"] >= 1,
+              "sync: hash-incremental upsert + chunk-level embedding reuse")
+        (vault / "Armory/Test Idea.md").unlink()
+        r4 = sync(vault, store, emb)
+        check(r4["deleted"] == 1 and "Armory/Test Idea.md" not in store.data["nodes"],
+              "sync: deleted file removed with its edges")
+
+        res = hybrid_search(store, emb, "knowledge graph", k=5)
+        check(res and res[0]["path"] == kg, "search: 'knowledge graph' ranks the concept first")
+        check(all(not store.data["nodes"][r["path"]]["redirect"] for r in res),
+              "search: redirect stubs never returned")
+        check(any("graph" in r["via"] for r in hybrid_search(store, emb, "knowledge graph", k=10, hops=1)),
+              "search: graph expansion contributes neighbors")
+        ents = hybrid_search(store, emb, "obsidian", k=10, type_filter="entity")
+        check(ents and all(r["type"] == "entity" for r in ents), "search: type filter works")
+
+        try:
+            from cortex_api import make_handler
+            from http.server import ThreadingHTTPServer
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store, emb))
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            get = lambda path: json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port}{path}", timeout=10).read())
+            check(get("/health")["ok"], "api: /health")
+            check(get("/search?" + urlencode({"q": "knowledge graph"}))["results"][0]["path"] == kg,
+                  "api: /search live")
+            check(get("/node?" + urlencode({"path": kg}))["node"]["title"] == "Knowledge Graph",
+                  "api: /node live")
+            g = get("/graph?" + urlencode({"path": kg, "hops": 2}))
+            check(g["nodes"] and g["edges"] and "id" in g["nodes"][0], "api: /graph XYFlow shape")
+            srv.shutdown()
+        except ImportError:
+            print("SKIP api checks (cortex_api.py not next to cortex_sync.py)")
+        print(f"\nSELF-TEST: {len(passed)} checks passed")
+        return 0
+    except Exception:
+        traceback.print_exc()
+        print("\nSELF-TEST FAILED")
+        return 1
+
+# ---------------------------------------------------------------- CLI
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="CortexOS sync engine: vault -> graph store")
+    ap.add_argument("--vault", default="../CortexVault")
+    ap.add_argument("--store", choices=["memory", "pg"], default="memory")
+    ap.add_argument("--db", default=None, help="Postgres URL (or DATABASE_URL env)")
+    ap.add_argument("--state", default="cortex_store.json", help="MemoryStore JSON path")
+    ap.add_argument("--embedder", choices=["auto", "openai", "hash"], default="auto")
+    ap.add_argument("--full", action="store_true", help="force re-upsert + re-embed everything")
+    ap.add_argument("--no-embed", action="store_true", help="graph only, skip embedding calls")
+    ap.add_argument("--watch", type=int, default=0, metavar="SECONDS", help="poll loop")
+    ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--init-db", action="store_true", help="apply schema (pg only)")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.self_test:
+        return self_test()
+    store = make_store(args)
+    try:
+        if args.init_db:
+            store.init()
+            print("schema applied")
+            return 0
+        if args.stats:
+            print(json.dumps(store.stats(), indent=1, default=str))
+            return 0
+        embedder = make_embedder(args.embedder)
+        while True:
+            report = sync(args.vault, store, embedder, full=args.full, no_embed=args.no_embed)
+            print(json.dumps(report, indent=1))
+            if not args.watch:
+                return 0
+            args.full = False
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        store.close()
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## `CortexEngine/cortex_api.py`
+
+```python
+#!/usr/bin/env python3
+# CortexOS Retrieval API - stdlib HTTP server over MemoryStore or PgStore.
+# Endpoints: /health /search /node /graph  (CORS enabled for the future XYFlow UI)
+
+import json, argparse, logging
+from urllib.parse import urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from cortex_sync import make_store, make_embedder, hybrid_search, LOG
+
+def make_handler(store, embedder):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            LOG.debug(fmt, *a)
+        def _send(self, code, obj):
+            data = json.dumps(obj, default=str).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            try:
+                if hasattr(store, "maybe_reload"):
+                    store.maybe_reload()
+                if u.path == "/health":
+                    self._send(200, {"ok": True, "stats": store.stats()})
+                elif u.path == "/search":
+                    if not q.get("q"):
+                        return self._send(400, {"error": "q required"})
+                    res = hybrid_search(store, embedder, q["q"], k=int(q.get("k", 10)),
+                                        type_filter=q.get("type"), hops=int(q.get("hops", 1)))
+                    self._send(200, {"query": q["q"], "results": res})
+                elif u.path == "/node":
+                    p = q.get("path", "")
+                    ns = store.get_nodes([p])
+                    if p not in ns:
+                        return self._send(404, {"error": "not found", "path": p})
+                    n = ns[p]
+                    self._send(200, {"node": {k: n[k] for k in
+                                     ("path", "title", "type", "props", "updated", "redirect")},
+                                     "edges": store.graph_for(p)})
+                elif u.path == "/graph":
+                    p = q.get("path", "")
+                    if p not in store.get_nodes([p]):
+                        return self._send(404, {"error": "not found", "path": p})
+                    reach = {p} | {r[0] for r in store.neighborhood([p], int(q.get("hops", 2)))}
+                    nodes = store.get_nodes(sorted(reach))
+                    es = store.graph(sorted(reach))
+                    self._send(200, {
+                        "nodes": [{"id": n["path"], "label": n["title"], "type": n["type"]}
+                                  for n in nodes.values()],
+                        "edges": [{"source": e["src"], "target": e["dst"], "kind": e["kind"]}
+                                  for e in es]})
+                else:
+                    self._send(404, {"error": "unknown endpoint"})
+            except Exception as e:
+                self._send(500, {"error": str(e)})
+    return H
+
+def main():
+    ap = argparse.ArgumentParser(description="CortexOS retrieval API")
+    ap.add_argument("--store", choices=["memory", "pg"], default="memory")
+    ap.add_argument("--db", default=None)
+    ap.add_argument("--state", default="cortex_store.json")
+    ap.add_argument("--embedder", choices=["auto", "openai", "hash"], default="auto")
+    ap.add_argument("--port", type=int, default=8765)
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    store = make_store(args)
+    embedder = make_embedder(args.embedder)
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(store, embedder))
+    LOG.info("CortexOS API on http://127.0.0.1:%d (store=%s)", args.port, args.store)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        store.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+## Runbook
+
+```bash
+mkdir CortexEngine && cd CortexEngine     # sibling of CortexVault, CortexResearch
+pip install pyyaml                        # only required dep for memory mode
+# save both files here
+
+python cortex_sync.py --self-test         # VERIFICATION GATE: ~25 checks, no infra needed
+python cortex_sync.py --vault ../CortexVault          # sync into cortex_store.json
+python cortex_api.py --port 8765 &                    # serve retrieval
+curl "http://127.0.0.1:8765/search?q=phase+7+api+bridge&k=8"
+curl "http://127.0.0.1:8765/graph?path=Wiki/Entities/CortexOS.md&hops=2"
+```
+
+**Production Postgres** (when ready — pgvector image, PG16):
+
+```bash
+docker run -d --name cortex-pg -e POSTGRES_PASSWORD=cortex -e POSTGRES_DB=cortex \
+  -p 5432:5432 pgvector/pgvector:pg16
+pip install "psycopg[binary]"
+python cortex_sync.py --store pg --db postgresql://postgres:cortex@localhost:5432/cortex --init-db
+export DATABASE_URL=postgresql://postgres:cortex@localhost:5432/cortex
+export OPENAI_API_KEY=sk-...              # real semantic embeddings
+python cortex_sync.py --store pg --vault ../CortexVault --full
+python cortex_api.py --store pg --port 8765
+```
+
+**Close the loop** — in `CortexResearch/sources.json`, set the hook the Research Agent has been waiting for:
+
+```json
+"sync": {"command": ["python", "/abs/path/CortexEngine/cortex_sync.py",
+                     "--vault", "/abs/path/CortexVault",
+                     "--store", "pg", "--db", "postgresql://postgres:cortex@localhost:5432/cortex"]}
+```
+
+Now: cron → feeds → Inbox → Librarian ripple → git commit → **Postgres projection updated** → searchable via API. The full OODA loop, automated.
+
+## Design decisions worth knowing
+
+- **Hash incrementality at two levels:** file sha256 decides upserts; chunk sha256 decides embedding calls. Editing one paragraph re-embeds one chunk, not the note — and a no-op sync costs zero API calls (the self-test asserts both).
+- **Redirect stubs are resolved, not indexed:** links through merged entities retarget to the canonical node at parse time; stubs never appear in search or graph results.
+- **Embedder identity is guarded:** provider/model/dim live in `meta`; switching hash→OpenAI without `--full` refuses to run, so you can never silently mix vector spaces.
+- **The hash embedder is lexical, not semantic** — it exists so the pipeline runs with zero keys. Production quality comes from `text-embedding-3-small`; the fusion code is identical either way.
+- **Known limitation (deliberate):** edges are rebuilt only for changed source files. If a redirect stub's target changes, run a weekly `--full` (cheap: it re-embeds nothing whose chunks match). Typed edges beyond MENTIONS/REFERENCES/RELATED_TO come with the UI slice.
+- **What the self-test covers:** parser (zones, aliases, redirects, dangling links, edge typing), chunker, embedder determinism, four consecutive syncs (index → no-op → incremental edit with chunk reuse → delete), search ranking/filter/expansion, and all four HTTP endpoints live. What it can't cover on your behalf: the PgStore SQL against a real server — the `--init-db` + first `--full` run is your 2-minute smoke test, and I've kept every query simple and parameterized for exactly that reason.
+
+Run the self-test first and paste me the output — green means we go straight to the next slice: **the XYFlow Graph UI + Creator Dashboard** consuming `/graph` and `/search`, which is where CortexOS finally becomes visible.
+

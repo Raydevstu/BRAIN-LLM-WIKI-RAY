@@ -55,6 +55,7 @@ export interface GraphContextValue {
   labelMode: "anchors" | "all" | "none";
   motionEnabled: boolean;
   viewAngle: "3d" | "topdown";
+  viewMode: "3d" | "2d";
   cameraResetTick: number;
   activeFocusSet: Set<string> | null;
   clusterHubs: Record<string, ClusterHubConfig>;
@@ -74,6 +75,7 @@ export interface GraphContextValue {
   setLabelMode: (mode: "anchors" | "all" | "none") => void;
   setMotionEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   setViewAngle: (angle: "3d" | "topdown") => void;
+  setViewMode: (mode: "3d" | "2d") => void;
   setCreatorDrawerOpen: React.Dispatch<React.SetStateAction<boolean>>;
   focusNodeEgo: (nodeId: string) => void;
   triggerCameraReset: () => void;
@@ -265,6 +267,7 @@ export function GraphProvider({
   const [labelMode, setLabelMode] = useState<"anchors" | "all" | "none">("anchors");
   const [motionEnabled, setMotionEnabled] = useState(true);
   const [viewAngle, setViewAngle] = useState<"3d" | "topdown">("3d");
+  const [viewMode, setViewMode] = useState<"3d" | "2d">("3d");
   const [cameraResetTick, setCameraResetTick] = useState(0);
   const [creatorDrawerOpen, setCreatorDrawerOpen] = useState(false);
   const [isSyncingVault, setIsSyncingVault] = useState(false);
@@ -535,6 +538,7 @@ export function GraphProvider({
     labelMode,
     motionEnabled,
     viewAngle,
+    viewMode,
     cameraResetTick,
     activeFocusSet,
     clusterHubs,
@@ -554,6 +558,7 @@ export function GraphProvider({
     setLabelMode,
     setMotionEnabled,
     setViewAngle,
+    setViewMode,
     setCreatorDrawerOpen,
     focusNodeEgo,
     triggerCameraReset,

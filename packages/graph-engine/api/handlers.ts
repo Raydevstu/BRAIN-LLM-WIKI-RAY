@@ -10,6 +10,12 @@ import {
   getFilteredEgoGraph,
 } from "./creator-widgets";
 import { syncVaultToDatabase } from "../services/vault-sync";
+import {
+  addResearchSource,
+  getResearchStatus,
+  removeResearchSource,
+  runResearchPipeline,
+} from "../services/research-agent";
 import type {
   CreateGraphNodeInput,
   GraphEdge,
@@ -18,6 +24,7 @@ import type {
   GraphSubgraph,
   KnowledgeClaim,
   LinkGraphNodesInput,
+  ResearchSourceConfig,
   UpdateGraphNodeInput,
 } from "../types";
 
@@ -655,6 +662,59 @@ export function createGraphApiHandlers(config: GraphApiConfig = {}) {
     }
   }
 
+  async function getResearch(): Promise<Response> {
+    try {
+      return Response.json(getResearchStatus());
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500 });
+    }
+  }
+
+  async function runResearch(req: Request): Promise<Response> {
+    const authErr = await guard(req);
+    if (authErr) return authErr;
+
+    try {
+      const body = (await req.json()) as {
+        action?: "fetch_only" | "process_inbox" | "run_pipeline" | "add_source" | "remove_source";
+        budget?: number;
+        maxPerSource?: number;
+        source?: ResearchSourceConfig;
+        sourceName?: string;
+      };
+      const action = body.action || "run_pipeline";
+
+      if (action === "add_source") {
+        if (!body.source?.name || !body.source?.kind) {
+          return Response.json(
+            { error: "source.name and source.kind are required" },
+            { status: 422 }
+          );
+        }
+        return Response.json({ status: addResearchSource(body.source) });
+      }
+
+      if (action === "remove_source") {
+        if (!body.sourceName) {
+          return Response.json(
+            { error: "sourceName is required" },
+            { status: 422 }
+          );
+        }
+        return Response.json({ status: removeResearchSource(body.sourceName) });
+      }
+
+      const result = await runResearchPipeline({
+        mode: action,
+        budget: body.budget,
+        maxPerSource: body.maxPerSource,
+      });
+      return Response.json(result);
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500 });
+    }
+  }
+
   return {
     getGraph,
     createNode,
@@ -670,5 +730,7 @@ export function createGraphApiHandlers(config: GraphApiConfig = {}) {
     getCreatorStats,
     syncVault,
     getVaultBrainStatus,
+    getResearch,
+    runResearch,
   };
 }

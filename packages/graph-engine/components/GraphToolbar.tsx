@@ -20,6 +20,7 @@ import {
   Plus,
   Radio,
   RotateCcw,
+  Share2,
 } from "lucide-react";
 import {
   DEFAULT_GRAPH_THEMES,
@@ -70,6 +71,8 @@ export function GraphToolbar({
     setMotionEnabled,
     viewAngle,
     setViewAngle,
+    viewMode,
+    setViewMode,
     triggerCameraReset,
     creatorDrawerOpen,
     setCreatorDrawerOpen,
@@ -93,6 +96,36 @@ export function GraphToolbar({
         </div>
 
         <div className="pointer-events-auto flex items-center gap-2.5">
+          <div
+            className="flex items-center rounded-lg border border-slate-700/80 bg-slate-900/95 p-0.5 text-xs"
+            role="group"
+            aria-label="Graph view mode"
+          >
+            <button
+              type="button"
+              onClick={() => setViewMode("3d")}
+              className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium whitespace-nowrap shrink-0 transition-colors ${
+                viewMode === "3d"
+                  ? "bg-sky-500/25 text-sky-200"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Boxes className="h-3.5 w-3.5" />
+              <span>3D Spatial</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("2d")}
+              className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium whitespace-nowrap shrink-0 transition-colors ${
+                viewMode === "2d"
+                  ? "bg-sky-500/25 text-sky-200"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Share2 className="h-3.5 w-3.5" />
+              <span>2D XYFlow</span>
+            </button>
+          </div>
           <GraphSearch />
           <button
             type="button"
@@ -130,6 +163,7 @@ export function GraphToolbar({
       </header>
 
       {/* Collapsible Bottom Control Dock (Zero Viewport Occlusion) */}
+      {viewMode === "3d" && (
       <div className="pointer-events-none fixed inset-x-0 bottom-4 z-30 flex flex-col items-center px-3">
         <button
           type="button"
@@ -304,6 +338,7 @@ export function GraphToolbar({
           </div>
         )}
       </div>
+      )}
     </>
   );
 }

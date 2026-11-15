@@ -244,6 +244,42 @@ export interface EgoGraphData {
   }>;
 }
 
+export interface ResearchSourceConfig {
+  name: string;
+  kind: "youtube" | "arxiv" | "rss";
+  url?: string;
+  handle?: string;
+  channel_id?: string;
+  categories?: string[];
+  fetch?: number;
+  priority?: number;
+  tags?: string[];
+  include?: string[];
+  exclude?: string[];
+}
+
+export interface ResearchRunReport {
+  started: string;
+  finished: string;
+  vault: string;
+  fetched: Record<string, number>;
+  dropped: string[];
+  processedInbox?: string[];
+  createdSummaries?: string[];
+  errors: string[];
+  syncStats?: VaultSyncStats | null;
+}
+
+export interface ResearchStatusData {
+  sources: ResearchSourceConfig[];
+  budgetPerRun: number;
+  maxPerSource: number;
+  pendingInboxFiles: string[];
+  seenCount: number;
+  cachedChannels: Record<string, string>;
+  recentRuns: ResearchRunReport[];
+}
+
 export interface ExtractedEntity {
   canonicalName: string;
   entityType: string;

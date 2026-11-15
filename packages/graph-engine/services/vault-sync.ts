@@ -20,7 +20,7 @@ export interface ParsedVaultNote {
   redirectTarget: string | null;
 }
 
-const SYNC_FOLDERS = ["Wiki", "Doctrine", "Armory"];
+const SYNC_FOLDERS = ["Wiki", "Doctrine", "Armory", "Raw"];
 
 function parseYamlValue(rawVal: string): unknown {
   const trimmed = rawVal.trim();
@@ -90,6 +90,9 @@ function mapVaultTypeToGraphKind(
   }
   if (lower === "idea" || relPath.startsWith("Armory/")) {
     return { kind: "idea", category: "Armory Idea", cluster: "armory" };
+  }
+  if (lower === "raw" || relPath.startsWith("Raw/")) {
+    return { kind: "note", category: "Raw Source", cluster: "research" };
   }
   return { kind: "note", category: "Note", cluster: "general" };
 }
@@ -185,9 +188,33 @@ export async function syncVaultToDatabase(
   let skippedUnchanged = 0;
 
   const lookupMap = new Map<string, string>();
+  const kindById = new Map<string, GraphNodeKind>();
+  const redirectByKey = new Map<string, string>();
+
+  for (const note of notes) {
+    if (note.isRedirect && note.redirectTarget) {
+      redirectByKey.set(note.title.toLowerCase(), note.redirectTarget);
+      for (const alias of note.aliases) {
+        redirectByKey.set(alias.toLowerCase(), note.redirectTarget);
+      }
+    }
+  }
+
+  const resolveTargetId = (rawTarget: string): string | undefined => {
+    let cur = rawTarget.trim().toLowerCase();
+    for (let depth = 0; depth < 5; depth++) {
+      const direct = lookupMap.get(cur);
+      if (direct) return direct;
+      const next = redirectByKey.get(cur);
+      if (!next) break;
+      cur = next.trim().toLowerCase();
+    }
+    return lookupMap.get(cur);
+  };
 
   for (const note of activeNotes) {
     const nodeId = toUuid(`vault:${note.vaultPath}`);
+    kindById.set(nodeId, note.kind);
     lookupMap.set(note.title.toLowerCase(), nodeId);
     for (const alias of note.aliases) {
       lookupMap.set(alias.toLowerCase(), nodeId);
@@ -294,11 +321,16 @@ export async function syncVaultToDatabase(
 
     const allTargets = new Set([...bodyLinks, ...sourceLinks]);
     for (const targetName of allTargets) {
-      const toId = lookupMap.get(targetName.toLowerCase());
+      const toId = resolveTargetId(targetName);
       if (!toId || toId === fromId) continue;
 
+      const toKind = kindById.get(toId);
       const edgeType = sourceLinks.includes(targetName)
         ? "cited_in_source"
+        : note.kind === "source"
+        ? "mentions"
+        : note.kind === "entity" && toKind === "entity"
+        ? "relates_to"
         : "references";
 
       await dbQuery(

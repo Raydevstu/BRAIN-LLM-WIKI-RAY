@@ -36,6 +36,13 @@ export {
   exportVaultRepoBrainJson,
 } from "./services/vault-sync";
 export {
+  getResearchStatus,
+  addResearchSource,
+  removeResearchSource,
+  processVaultInbox,
+  runResearchPipeline,
+} from "./services/research-agent";
+export {
   getTrendGapWidget,
   getCompetitorCoverageMatrix,
   getCreatorPipelineBoard,

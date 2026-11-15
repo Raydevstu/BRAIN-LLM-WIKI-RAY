@@ -1,0 +1,68 @@
+{
+  "vault": "../CortexVault",
+  "budget_per_run": 12,
+  "max_per_source": 5,
+  "polite_delay_s": 1.0,
+  "http_timeout_s": 30,
+  "librarian": {
+    "enabled": true,
+    "command": [
+      "claude",
+      "-p",
+      "Run the daily routine per CLAUDE.md: process Inbox fully, reconcile the board, fix broken links, append the Log entry.",
+      "--permission-mode",
+      "acceptEdits"
+    ],
+    "timeout_s": 900
+  },
+  "git": {
+    "auto_commit": true
+  },
+  "sync": {
+    "command": [
+      "python3",
+      "../CortexEngine/cortex_sync.py",
+      "--vault",
+      "../CortexVault"
+    ]
+  },
+  "notify": {
+    "webhook_url": null,
+    "style": "slack"
+  },
+  "sources": [
+    {
+      "name": "Wes Roth",
+      "kind": "youtube",
+      "handle": "@WesRoth",
+      "priority": 1,
+      "tags": [
+        "competitor-coverage",
+        "ai-news"
+      ]
+    },
+    {
+      "name": "arXiv AI/CL/LG",
+      "kind": "arxiv",
+      "categories": [
+        "cs.AI",
+        "cs.CL",
+        "cs.LG"
+      ],
+      "fetch": 40,
+      "priority": 2
+    },
+    {
+      "name": "Google AI Blog",
+      "kind": "rss",
+      "url": "https://blog.google/technology/ai/rss/",
+      "priority": 3
+    },
+    {
+      "name": "Hugging Face Blog",
+      "kind": "rss",
+      "url": "https://huggingface.co/blog/feed.xml",
+      "priority": 3
+    }
+  ]
+}

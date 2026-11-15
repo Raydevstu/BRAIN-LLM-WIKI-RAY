@@ -19,9 +19,12 @@ export function computeLineLocator(rawContent: string, quote: string): string {
 
 /**
  * Extracts canonical target titles from [[Target]], [[Target|Alias]], and [[Folder/Target#Heading|Alias]]
+ * ignoring fenced code blocks and inline backtick code spans.
  */
 export function extractExplicitWikiLinks(content: string): string[] {
-  const matches = Array.from(content.matchAll(/\[\[([^\]]+)\]\]/g));
+  const withoutFences = content.replace(/```[\s\S]*?```/g, "");
+  const withoutInlineCode = withoutFences.replace(/`[^`]*`/g, "");
+  const matches = Array.from(withoutInlineCode.matchAll(/\[\[([^\]]+)\]\]/g));
   const targets = new Set<string>();
   for (const m of matches) {
     const rawInner = m[1].trim();
@@ -303,19 +306,72 @@ export async function linkAndIndexNode(params: {
   const textToEmbed = `${params.title}\n\n${params.content}`.trim();
   const chunks = chunkText(textToEmbed, 900, 150);
 
-  await dbQuery("DELETE FROM graph_embeddings WHERE node_id = $1", [params.nodeId]);
+  // Load prior chunk hashes + vectors for chunk-level embedding reuse
+  const existingChunksRes = await dbQuery<{
+    chunk_hash: string;
+    chunk_text: string;
+    embedding_text: string;
+  }>(
+    `SELECT chunk_hash, chunk_text, embedding::text AS embedding_text
+       FROM graph_embeddings
+      WHERE node_id = $1 AND model = $2`,
+    [params.nodeId, EMBEDDING_MODEL]
+  );
+  const existingByHash = new Map<string, string>();
+  for (const row of existingChunksRes.rows) {
+    const h = row.chunk_hash || sha256Hex(row.chunk_text);
+    if (row.embedding_text) {
+      existingByHash.set(h, row.embedding_text);
+    }
+  }
+
+  const prepared: Array<{
+    index: number;
+    text: string;
+    hash: string;
+    vecParam: string | number[];
+    vecCast: string;
+  }> = [];
 
   for (let i = 0; i < chunks.length; i++) {
-    const vec = await embedText1536(chunks[i]);
-    const vecParam = isRemotePostgresUrl() ? `[${vec.join(",")}]` : vec;
-    const vecCast = isRemotePostgresUrl() ? "$5::vector" : "$5::real[]";
+    const cHash = sha256Hex(chunks[i]);
+    const cachedText = existingByHash.get(cHash);
+    if (cachedText) {
+      let vecParam: string | number[] = cachedText;
+      if (!isRemotePostgresUrl() && typeof cachedText === "string") {
+        vecParam = cachedText
+          .replace(/^[\[{]|[\]}]$/g, "")
+          .split(",")
+          .map((x) => Number(x));
+      }
+      prepared.push({
+        index: i,
+        text: chunks[i],
+        hash: cHash,
+        vecParam,
+        vecCast: isRemotePostgresUrl() ? "$6::vector" : "$6::real[]",
+      });
+    } else {
+      const vec = await embedText1536(chunks[i]);
+      prepared.push({
+        index: i,
+        text: chunks[i],
+        hash: cHash,
+        vecParam: isRemotePostgresUrl() ? `[${vec.join(",")}]` : vec,
+        vecCast: isRemotePostgresUrl() ? "$6::vector" : "$6::real[]",
+      });
+    }
+  }
 
+  await dbQuery("DELETE FROM graph_embeddings WHERE node_id = $1", [params.nodeId]);
+
+  for (const item of prepared) {
     await dbQuery(
-      `INSERT INTO graph_embeddings (node_id, chunk_index, chunk_text, model, embedding)
-       VALUES ($1, $2, $3, $4, ${vecCast})
+      `INSERT INTO graph_embeddings (node_id, chunk_index, chunk_text, chunk_hash, model, embedding)
+       VALUES ($1, $2, $3, $4, $5, ${item.vecCast})
        ON CONFLICT (node_id, chunk_index, model)
-       DO UPDATE SET chunk_text = EXCLUDED.chunk_text, embedding = EXCLUDED.embedding`,
-      [params.nodeId, i, chunks[i], EMBEDDING_MODEL, vecParam]
+       DO UPDATE SET chunk_text = EXCLUDED.chunk_text, chunk_hash = EXCLUDED.chunk_hash, embedding = EXCLUDED.embedding`,
+      [params.nodeId, item.index, item.text, item.hash, EMBEDDING_MODEL, item.vecParam]
     );
   }
 

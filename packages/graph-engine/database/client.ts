@@ -21,6 +21,7 @@ declare global {
   var __graphMigrated: boolean | undefined;
   var __graphMigratePromise: Promise<void> | undefined;
   var __graphMutexPromise: Promise<unknown> | undefined;
+  var __graphUseRemotePg: boolean | undefined;
 }
 
 export function sha256Hex(input: string): string {
@@ -43,40 +44,60 @@ export function toUuid(idOrSeed: string): string {
   )}-${h.slice(20, 32)}`;
 }
 
-export function isRemotePostgresUrl(): boolean {
+function hasRemotePostgresEnv(): boolean {
   const url = process.env.DATABASE_URL?.trim();
   if (!url || url === "MY_DATABASE_URL") return false;
   return url.startsWith("postgres://") || url.startsWith("postgresql://");
 }
 
+export function isRemotePostgresUrl(): boolean {
+  if (typeof global.__graphUseRemotePg === "boolean") {
+    return global.__graphUseRemotePg;
+  }
+  return hasRemotePostgresEnv();
+}
+
 async function createExecutor(): Promise<QueryExecutor> {
-  if (isRemotePostgresUrl()) {
+  if (hasRemotePostgresEnv() && global.__graphUseRemotePg !== false) {
     const connStr = process.env.DATABASE_URL!.trim();
-    if (!global.__graphPgSql) {
-      global.__graphPgSql = postgres(connStr, {
-        max: 10,
-        idle_timeout: 20,
-        connect_timeout: 15,
-      });
+    try {
+      if (!global.__graphPgSql) {
+        global.__graphPgSql = postgres(connStr, {
+          max: 10,
+          idle_timeout: 20,
+          connect_timeout: 3,
+        });
+      }
+      const sqlClient = global.__graphPgSql;
+      await sqlClient.unsafe("SELECT 1");
+      global.__graphUseRemotePg = true;
+      return {
+        async query<T = Record<string, unknown>>(
+          text: string,
+          params: unknown[] = []
+        ): Promise<{ rows: T[] }> {
+          const result = await sqlClient.unsafe<T[]>(
+            text,
+            params as postgres.ParameterOrJSON<never>[]
+          );
+          return { rows: Array.from(result) };
+        },
+        async exec(rawSql: string): Promise<void> {
+          await sqlClient.unsafe(rawSql);
+        },
+      };
+    } catch {
+      global.__graphUseRemotePg = false;
+      try {
+        await global.__graphPgSql?.end({ timeout: 1 });
+      } catch {
+        // Ignore close failure
+      }
+      global.__graphPgSql = undefined;
     }
-    const sqlClient = global.__graphPgSql;
-    return {
-      async query<T = Record<string, unknown>>(
-        text: string,
-        params: unknown[] = []
-      ): Promise<{ rows: T[] }> {
-        const result = await sqlClient.unsafe<T[]>(
-          text,
-          params as postgres.ParameterOrJSON<never>[]
-        );
-        return { rows: Array.from(result) };
-      },
-      async exec(rawSql: string): Promise<void> {
-        await sqlClient.unsafe(rawSql);
-      },
-    };
   }
 
+  global.__graphUseRemotePg = false;
   if (!global.__graphPglite) {
     const customDir = process.env.GRAPH_PGDATA_DIR?.trim();
     const dataDir =

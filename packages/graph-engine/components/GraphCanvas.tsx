@@ -18,6 +18,7 @@ import { GraphContextMenu } from "./GraphContextMenu";
 import { NodeInspector } from "./NodeInspector";
 import { CreateNodeModal } from "./CreateNodeModal";
 import { CreatorDashboard } from "./CreatorDashboard";
+import { EgoGraphFlow } from "./EgoGraphFlow";
 
 // Pre-allocated math helpers outside render loop (zero GC)
 const _projVec = new THREE.Vector3();
@@ -70,6 +71,7 @@ export function GraphCanvas({
     labelMode,
     motionEnabled,
     viewAngle,
+    viewMode,
     cameraResetTick,
     setSelectedNodeId,
     setHoveredNodeId,
@@ -839,10 +841,27 @@ export function GraphCanvas({
       style={{ backgroundColor: theme.bg }}
     >
       {/* Dedicated WebGL Mount Ref (Isolated from React HUD children) */}
-      <div ref={mountRef} className="absolute inset-0 h-full w-full" />
+      <div
+        ref={mountRef}
+        className={`absolute inset-0 h-full w-full ${
+          viewMode === "2d" ? "pointer-events-none opacity-0" : ""
+        }`}
+      />
+
+      {/* 2D XYFlow Filtered Ego-Graph View */}
+      {viewMode === "2d" && (
+        <div className="absolute inset-0 z-10 h-full w-full">
+          <EgoGraphFlow
+            onSelectNode={(nodeId) => {
+              setSelectedNodeId(nodeId);
+              setDismissedNodeId(null);
+            }}
+          />
+        </div>
+      )}
 
       {/* WebGL Unavailable or Context Lost Fallback */}
-      {(webglUnavailable || webglLost) && (
+      {viewMode === "3d" && (webglUnavailable || webglLost) && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/95 p-6">
           <div className="max-w-md rounded-xl border border-slate-800 bg-slate-900 p-6 text-center">
             <h2 className="text-base font-semibold text-white">
@@ -850,14 +869,18 @@ export function GraphCanvas({
             </h2>
             <p className="mt-2 text-xs text-slate-400">
               Your graph has {nodes.length} nodes and {edges.length} edges indexed in
-              PostgreSQL. Use the search bar above to inspect any node directly.
+              PostgreSQL. Switch to 2D XYFlow or use search to inspect any node directly.
             </p>
           </div>
         </div>
       )}
 
-      {/* Projected 2D DOM Labels */}
-      <div className="ge-label-overlay" aria-hidden={labelMode === "none"}>
+      {/* Projected 2D DOM Labels (3D Mode only) */}
+      <div
+        className="ge-label-overlay"
+        aria-hidden={viewMode === "2d" || labelMode === "none"}
+        style={{ display: viewMode === "2d" ? "none" : undefined }}
+      >
         {filteredNodes.map((node) => (
           <button
             key={node.id}

@@ -23,3 +23,4 @@ export { GraphContextMenu } from "./components/GraphContextMenu";
 export { NodeInspector } from "./components/NodeInspector";
 export { CreateNodeModal } from "./components/CreateNodeModal";
 export { CreatorDashboard } from "./components/CreatorDashboard";
+export { EgoGraphFlow } from "./components/EgoGraphFlow";
