@@ -17,6 +17,24 @@ export function computeLineLocator(rawContent: string, quote: string): string {
   return `line ${lineIndex >= 0 ? lineIndex + 1 : 1}`;
 }
 
+/**
+ * Extracts canonical target titles from [[Target]], [[Target|Alias]], and [[Folder/Target#Heading|Alias]]
+ */
+export function extractExplicitWikiLinks(content: string): string[] {
+  const matches = Array.from(content.matchAll(/\[\[([^\]]+)\]\]/g));
+  const targets = new Set<string>();
+  for (const m of matches) {
+    const rawInner = m[1].trim();
+    if (!rawInner) continue;
+    const beforePipe = rawInner.split("|")[0].trim();
+    const beforeHash = beforePipe.split("#")[0].trim();
+    const basename = beforeHash.split("/").pop()?.trim() || beforeHash;
+    const clean = basename.replace(/\.md$/i, "").trim();
+    if (clean) targets.add(clean);
+  }
+  return Array.from(targets);
+}
+
 function deterministicFallbackExtraction(
   title: string,
   content: string
@@ -26,12 +44,10 @@ function deterministicFallbackExtraction(
     .map((l) => l.trim())
     .filter(Boolean);
 
-  const wikiLinks = Array.from(content.matchAll(/\[\[([^\]]+)\]\]/g)).map((m) =>
-    m[1].trim()
-  );
-  const hashtags = Array.from(content.matchAll(/#([a-zA-Z0-9_-]+)/g)).map((m) =>
-    m[1].toLowerCase()
-  );
+  const wikiLinks = extractExplicitWikiLinks(content);
+  const hashtags = Array.from(
+    content.matchAll(/(?:^|\s)#([a-zA-Z0-9_-]+)/g)
+  ).map((m) => m[1].toLowerCase());
 
   const properNouns = Array.from(
     new Set(
@@ -50,7 +66,7 @@ function deterministicFallbackExtraction(
   }));
 
   const concepts = Array.from(new Set([...wikiLinks, ...hashtags]))
-    .slice(0, 5)
+    .slice(0, 8)
     .map((name) => ({
       name,
       domain: "knowledge",
@@ -68,18 +84,18 @@ function deterministicFallbackExtraction(
       fromName: title,
       toName: c.name,
       edgeType: "relates_to",
-      confidence: 0.85,
+      confidence: 0.9,
     })),
   ];
 
   const claims = lines
-    .filter((l) => !l.startsWith("#") && l.length > 20)
-    .slice(0, 3)
+    .filter((l) => !l.startsWith("#") && !l.startsWith("---") && l.length > 20)
+    .slice(0, 4)
     .map((line) => ({
       claimText: line.slice(0, 180),
       verbatimQuote: line.slice(0, 120),
       locator: computeLineLocator(content, line.slice(0, 80)),
-      confidence: 0.75,
+      confidence: 0.85,
     }));
 
   return {
@@ -87,7 +103,9 @@ function deterministicFallbackExtraction(
     concepts,
     relationships,
     claims,
-    summary: lines.find((l) => !l.startsWith("#"))?.slice(0, 220) || title,
+    summary:
+      lines.find((l) => !l.startsWith("#") && !l.startsWith("---"))?.slice(0, 220) ||
+      title,
     tags: hashtags.slice(0, 6),
     isFallback: true,
   };
@@ -112,7 +130,7 @@ export async function extractKnowledgeWithAiOrFallback(
       },
     });
 
-    const prompt = `Analyze the following document and extract structured knowledge graph entities, concepts, relationships, and grounded claims.
+    const prompt = `Analyze the following document and extract structured knowledge graph entities, concepts, relationships, and grounded claims. Never invent facts not grounded in the text.
 
 Title: ${title}
 
@@ -203,39 +221,70 @@ ${content.slice(0, 12000)}`;
   }
 }
 
-async function resolveOrCreateNodeByName(
+export async function resolveOrCreateNodeByName(
   title: string,
   kind: "entity" | "concept",
   summary: string,
-  cluster: string
+  cluster: string,
+  reviewState: "proposed" | "approved" = "proposed"
 ): Promise<string> {
-  const existingRes = await dbQuery<{ id: string }>(
+  const cleanTitle = title.trim();
+  const normalized = cleanTitle.toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+  // 1. Exact title match, alias match, or punctuation-insensitive normalized match
+  const exactRes = await dbQuery<{ id: string }>(
     `SELECT id
        FROM graph_nodes
       WHERE merged_into_id IS NULL
-        AND (lower(title) = lower($1) OR similarity(lower(title), lower($1)) > 0.82)
-      ORDER BY similarity(lower(title), lower($1)) DESC
+        AND (
+          lower(title) = lower($1)
+          OR regexp_replace(lower(title), '[^a-z0-9]+', '', 'g') = $2
+          OR EXISTS (
+            SELECT 1 FROM unnest(aliases) a
+             WHERE lower(a) = lower($1)
+                OR regexp_replace(lower(a), '[^a-z0-9]+', '', 'g') = $2
+          )
+        )
       LIMIT 1`,
-    [title]
+    [cleanTitle, normalized]
   );
 
-  if (existingRes.rows[0]) {
-    return existingRes.rows[0].id;
+  if (exactRes.rows[0]) {
+    return exactRes.rows[0].id;
   }
 
-  const nodeId = toUuid(`${kind}:${title.toLowerCase()}`);
+  // 2. High-threshold trigram match only for titles >= 8 chars to avoid short-token collisions
+  if (cleanTitle.length >= 8) {
+    const trgmRes = await dbQuery<{ id: string }>(
+      `SELECT id
+         FROM graph_nodes
+        WHERE merged_into_id IS NULL
+          AND length(title) >= 8
+          AND similarity(lower(title), lower($1)) > 0.88
+        ORDER BY similarity(lower(title), lower($1)) DESC
+        LIMIT 1`,
+      [cleanTitle]
+    );
+
+    if (trgmRes.rows[0]) {
+      return trgmRes.rows[0].id;
+    }
+  }
+
+  const nodeId = toUuid(`${kind}:${cleanTitle.toLowerCase()}`);
   await dbQuery(
     `INSERT INTO graph_nodes (id, title, kind, category, cluster, summary, content, content_hash, review_state)
-     VALUES ($1, $2, $3::graph_node_kind, $4, $5, $6, $6, $7, 'proposed'::graph_review_state)
+     VALUES ($1, $2, $3::graph_node_kind, $4, $5, $6, $6, $7, $8::graph_review_state)
      ON CONFLICT (id) DO NOTHING`,
     [
       nodeId,
-      title,
+      cleanTitle,
       kind,
       kind === "entity" ? "Entity" : "Concept",
       cluster,
       summary,
-      sha256Hex(`${kind}:${title}:${summary}`),
+      sha256Hex(`${kind}:${cleanTitle}:${summary}`),
+      reviewState,
     ]
   );
 
@@ -248,6 +297,8 @@ export async function linkAndIndexNode(params: {
   content: string;
   cluster: string;
   autoExtractLinks?: boolean;
+  skipAiExtraction?: boolean;
+  skipExplicitLinks?: boolean;
 }): Promise<{ createdEdges: GraphEdge[]; chunksIndexed: number }> {
   const textToEmbed = `${params.title}\n\n${params.content}`.trim();
   const chunks = chunkText(textToEmbed, 900, 150);
@@ -269,7 +320,55 @@ export async function linkAndIndexNode(params: {
   }
 
   const createdEdges: GraphEdge[] = [];
-  if (!params.autoExtractLinks) {
+
+  if (!params.skipExplicitLinks) {
+    // Extract explicit [[wikilinks]] deterministically as APPROVED edges
+    const explicitLinks = extractExplicitWikiLinks(params.content);
+    for (const targetTitle of explicitLinks) {
+      if (targetTitle.toLowerCase() === params.title.toLowerCase()) continue;
+      const targetId = await resolveOrCreateNodeByName(
+        targetTitle,
+        "concept",
+        `Referenced via wikilink from "${params.title}".`,
+        params.cluster,
+        "approved"
+      );
+      if (targetId === params.nodeId) continue;
+
+      const edgeRes = await dbQuery<{
+        id: string;
+        from_id: string;
+        to_id: string;
+        edge_type: string;
+        confidence: number;
+        review_state: "proposed" | "approved" | "rejected";
+        created_at: string;
+      }>(
+        `INSERT INTO graph_edges (from_id, to_id, edge_type, confidence, source_id, review_state)
+         VALUES ($1, $2, 'references', 1.0, $1, 'approved'::graph_review_state)
+         ON CONFLICT (from_id, to_id, edge_type) WHERE superseded_at IS NULL
+         DO UPDATE SET confidence = 1.0, review_state = 'approved'::graph_review_state
+         RETURNING id, from_id, to_id, edge_type, confidence, review_state::text, created_at::text`,
+        [params.nodeId, targetId]
+      );
+
+      if (edgeRes.rows[0]) {
+        const r = edgeRes.rows[0];
+        createdEdges.push({
+          id: r.id,
+          fromId: r.from_id,
+          toId: r.to_id,
+          edgeType: r.edge_type,
+          confidence: r.confidence,
+          reviewState: r.review_state,
+          sourceId: params.nodeId,
+          createdAt: r.created_at,
+        });
+      }
+    }
+  }
+
+  if (!params.autoExtractLinks || params.skipAiExtraction) {
     return { createdEdges, chunksIndexed: chunks.length };
   }
 
@@ -287,7 +386,8 @@ export async function linkAndIndexNode(params: {
       ent.canonicalName,
       "entity",
       ent.description,
-      params.cluster
+      params.cluster,
+      "proposed"
     );
     nameToId.set(ent.canonicalName.toLowerCase(), entId);
   }
@@ -297,7 +397,8 @@ export async function linkAndIndexNode(params: {
       con.name,
       "concept",
       con.summary,
-      params.cluster
+      params.cluster,
+      "proposed"
     );
     nameToId.set(con.name.toLowerCase(), conId);
   }
@@ -344,6 +445,9 @@ export async function linkAndIndexNode(params: {
       });
     }
   }
+
+  // Delete prior claims for this node before re-inserting so edits never duplicate claims
+  await dbQuery("DELETE FROM graph_claims WHERE node_id = $1", [params.nodeId]);
 
   for (const cl of extraction.claims) {
     await dbQuery(

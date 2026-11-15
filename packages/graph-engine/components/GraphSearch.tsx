@@ -98,7 +98,9 @@ export function GraphSearch() {
                   {hit.title}
                 </span>
                 <span className="shrink-0 font-mono text-[11px] text-sky-400">
-                  {hit.kind} · RRF {hit.rrfScore.toFixed(3)}
+                  {hit.kind}
+                  {hit.via ? ` · ${hit.via}` : ""}
+                  {` · RRF ${hit.rrfScore.toFixed(3)}`}
                 </span>
               </div>
               <p className="line-clamp-1 text-[11px] text-slate-400">{hit.snippet}</p>

@@ -16,6 +16,8 @@ import {
 import type {
   ClusterHubConfig,
   CreateGraphNodeInput,
+  CreatorDashboardData,
+  EgoGraphData,
   GraphEdge,
   GraphLayoutMode,
   GraphNode,
@@ -28,6 +30,7 @@ import type {
   KnowledgeClaim,
   LinkGraphNodesInput,
   UpdateGraphNodeInput,
+  VaultSyncStats,
   WikiDigestResult,
 } from "../types";
 
@@ -55,6 +58,9 @@ export interface GraphContextValue {
   cameraResetTick: number;
   activeFocusSet: Set<string> | null;
   clusterHubs: Record<string, ClusterHubConfig>;
+  creatorDrawerOpen: boolean;
+  isSyncingVault: boolean;
+  lastSyncStats: VaultSyncStats | null;
   setSelectedNodeId: (id: string | null) => void;
   setHoveredNodeId: (id: string | null) => void;
   setLayout: (layout: GraphLayoutMode) => void;
@@ -68,6 +74,8 @@ export interface GraphContextValue {
   setLabelMode: (mode: "anchors" | "all" | "none") => void;
   setMotionEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   setViewAngle: (angle: "3d" | "topdown") => void;
+  setCreatorDrawerOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  focusNodeEgo: (nodeId: string) => void;
   triggerCameraReset: () => void;
   refreshGraph: (rootId?: string, depth?: number) => Promise<void>;
   createNode: (input: CreateGraphNodeInput) => Promise<GraphNode>;
@@ -82,6 +90,12 @@ export interface GraphContextValue {
     question: string
   ) => Promise<{ answer: string; model?: string }>;
   digestNote: (rawNote: string, categories?: string[]) => Promise<WikiDigestResult>;
+  syncVault: (options?: {
+    vaultPath?: string;
+    enableAiEnrichment?: boolean;
+  }) => Promise<VaultSyncStats>;
+  fetchCreatorStats: () => Promise<CreatorDashboardData>;
+  fetchEgoGraph: (nodeId?: string | null, hops?: number) => Promise<EgoGraphData>;
 }
 
 export const GraphContext = createContext<GraphContextValue | null>(null);
@@ -180,6 +194,32 @@ export function createRestStorageAdapter(
       if (!res.ok) throw new Error(`Digest failed (${res.status})`);
       return res.json();
     },
+    async syncVault(options) {
+      const res = await fetch("/api/vault/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(options || {}),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || `Vault sync failed (${res.status})`);
+      }
+      return res.json();
+    },
+    async fetchCreatorStats() {
+      const res = await fetch("/api/stats/creator", { cache: "no-store" });
+      if (!res.ok) throw new Error(`Creator stats failed (${res.status})`);
+      return res.json();
+    },
+    async fetchEgoGraph(nodeId, hops = 2) {
+      const params = new URLSearchParams({ hops: String(hops) });
+      if (nodeId) params.set("nodeId", nodeId);
+      const res = await fetch(`${cleanBase}/ego?${params.toString()}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) throw new Error(`Ego graph failed (${res.status})`);
+      return res.json();
+    },
   };
 }
 
@@ -226,6 +266,9 @@ export function GraphProvider({
   const [motionEnabled, setMotionEnabled] = useState(true);
   const [viewAngle, setViewAngle] = useState<"3d" | "topdown">("3d");
   const [cameraResetTick, setCameraResetTick] = useState(0);
+  const [creatorDrawerOpen, setCreatorDrawerOpen] = useState(false);
+  const [isSyncingVault, setIsSyncingVault] = useState(false);
+  const [lastSyncStats, setLastSyncStats] = useState<VaultSyncStats | null>(null);
 
   const { nodes, edges } = useMemo(
     () => computeGraphLayouts(rawNodes, rawEdges, clusterHubs),
@@ -289,6 +332,7 @@ export function GraphProvider({
         const hit =
           node.title.toLowerCase().includes(q) ||
           node.summary.toLowerCase().includes(q) ||
+          (node.aliases || []).some((a) => a.toLowerCase().includes(q)) ||
           node.tags.some((t) => t.toLowerCase().includes(q));
         if (!hit) return false;
       }
@@ -403,6 +447,64 @@ export function GraphProvider({
     [adapter]
   );
 
+  const syncVault = useCallback(
+    async (options?: { vaultPath?: string; enableAiEnrichment?: boolean }) => {
+      if (!adapter.syncVault) {
+        throw new Error("Vault sync not supported by storage adapter");
+      }
+      setIsSyncingVault(true);
+      setError(null);
+      try {
+        const stats = await adapter.syncVault(options);
+        setLastSyncStats(stats);
+        await refreshGraph(rootId, 2);
+        return stats;
+      } catch (err) {
+        setError((err as Error).message);
+        throw err;
+      } finally {
+        setIsSyncingVault(false);
+      }
+    },
+    [adapter, refreshGraph, rootId]
+  );
+
+  const fetchCreatorStats = useCallback(async (): Promise<CreatorDashboardData> => {
+    if (adapter.fetchCreatorStats) {
+      return adapter.fetchCreatorStats();
+    }
+    return {
+      trendGaps: [],
+      competitors: [],
+      pipeline: [],
+      counts: {
+        totalNodes: nodes.length,
+        vaultNotes: nodes.filter((n) => Boolean(n.vaultPath)).length,
+        concepts: nodes.filter((n) => n.kind === "concept").length,
+        entities: nodes.filter((n) => n.kind === "entity").length,
+        sources: nodes.filter((n) => n.kind === "source").length,
+        doctrines: nodes.filter((n) => n.kind === "doctrine").length,
+        ideas: nodes.filter((n) => n.kind === "idea").length,
+        edges: edges.length,
+      },
+    };
+  }, [adapter, nodes, edges]);
+
+  const fetchEgoGraph = useCallback(
+    async (nodeId?: string | null, hops = 2): Promise<EgoGraphData> => {
+      if (adapter.fetchEgoGraph) {
+        return adapter.fetchEgoGraph(nodeId, hops);
+      }
+      return { centerId: nodeId || null, hops, nodes: [], edges: [] };
+    },
+    [adapter]
+  );
+
+  const focusNodeEgo = useCallback((nodeId: string) => {
+    setSelectedNodeId(nodeId);
+    setFocusIsolation(true);
+  }, []);
+
   const triggerCameraReset = useCallback(() => {
     setCameraResetTick((t) => t + 1);
   }, []);
@@ -436,6 +538,9 @@ export function GraphProvider({
     cameraResetTick,
     activeFocusSet,
     clusterHubs,
+    creatorDrawerOpen,
+    isSyncingVault,
+    lastSyncStats,
     setSelectedNodeId,
     setHoveredNodeId,
     setLayout,
@@ -449,6 +554,8 @@ export function GraphProvider({
     setLabelMode,
     setMotionEnabled,
     setViewAngle,
+    setCreatorDrawerOpen,
+    focusNodeEgo,
     triggerCameraReset,
     refreshGraph,
     createNode,
@@ -460,6 +567,9 @@ export function GraphProvider({
     fetchNodeClaims,
     askNodeContext,
     digestNote,
+    syncVault,
+    fetchCreatorStats,
+    fetchEgoGraph,
   };
 
   return <GraphContext.Provider value={value}>{children}</GraphContext.Provider>;

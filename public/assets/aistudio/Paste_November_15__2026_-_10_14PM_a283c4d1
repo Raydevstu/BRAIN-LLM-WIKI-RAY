@@ -1,0 +1,1138 @@
+Yes — here's the full Phase 1 repo, built and tested. Before handing it over I ran it in the sandbox: **all backend modules compile, and the parser, link resolver, chunker, embedder, RRF fusion, and the full sync orchestration pass functional tests** (including: re-sync re-embeds zero unchanged files, deleted notes get pruned, alias/path/display wikilinks resolve, redirect stubs and system folders are skipped). Postgres, the live API, and the UI need Docker/npm on your machine — commands at the end.
+
+```
+cortexos/
+├─ docker-compose.yml  .env.example  Makefile  README.md
+├─ backend/
+│  ├─ requirements.txt
+│  └─ cortex/  __init__.py  config.py  schema.sql  db.py
+│              parser.py  embeddings.py  sync.py  cli.py
+│              retrieval.py  api.py
+└─ web/
+   ├─ package.json  tsconfig.json  next.config.mjs
+   ├─ lib/api.ts
+   ├─ components/GraphView.tsx
+   └─ app/  layout.tsx  page.tsx  globals.css
+```
+
+---
+
+## Slice 0 — Infrastructure
+
+**docker-compose.yml**
+```yaml
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: cortex
+      POSTGRES_PASSWORD: cortex
+      POSTGRES_DB: cortex
+    ports:
+      - "5432:5432"
+    volumes:
+      - cortex_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cortex"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  cortex_pg:
+```
+
+**.env.example**
+```bash
+DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex
+VAULT_PATH=../CortexVault
+EMBED_PROVIDER=hash            # switch to "openai" for real semantic search
+EMBED_MODEL=text-embedding-3-small
+EMBED_DIM=1536
+OPENAI_API_KEY=
+INCLUDE_RAW=false
+NEXT_PUBLIC_API_BASE=http://localhost:8000
+```
+
+**Makefile** *(recipe lines must be tabs)*
+```makefile
+up:
+	docker compose up -d db
+
+migrate:
+	cd backend && python -m cortex.cli migrate
+
+sync:
+	cd backend && python -m cortex.cli sync
+
+watch:
+	cd backend && python -m cortex.cli watch
+
+api:
+	cd backend && uvicorn cortex.api:app --reload --port 8000
+
+web:
+	cd web && npm run dev
+
+smoke:
+	curl -s localhost:8000/health && echo && curl -s 'localhost:8000/search?q=second+brain&limit=5'
+```
+
+**backend/requirements.txt**
+```
+fastapi>=0.115
+uvicorn[standard]>=0.30
+psycopg[binary,pool]>=3.2
+PyYAML>=6.0
+watchdog>=4.0
+openai>=1.40
+python-dotenv>=1.0
+```
+
+---
+
+## Slice 1 — Schema + DB layer
+
+**backend/cortex/\_\_init\_\_.py**
+```python
+__version__ = '0.1.0'
+```
+
+**backend/cortex/config.py**
+```python
+import os
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://cortex:cortex@localhost:5432/cortex")
+VAULT_PATH = Path(os.getenv("VAULT_PATH", "../CortexVault")).resolve()
+EMBED_PROVIDER = os.getenv("EMBED_PROVIDER", "hash")          # openai | hash (hash = offline dev only)
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+INCLUDE_RAW = os.getenv("INCLUDE_RAW", "false").lower() == "true"
+RRF_K = int(os.getenv("RRF_K", "60"))
+RECENCY_WEIGHT = float(os.getenv("RECENCY_WEIGHT", "0.25"))
+CANDIDATES = int(os.getenv("CANDIDATES", "30"))
+MAX_EGO_NODES = int(os.getenv("MAX_EGO_NODES", "120"))
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+```
+
+**backend/cortex/schema.sql** — `__DIM__` is substituted at migrate time.
+```sql
+create extension if not exists vector;
+
+create table if not exists nodes (
+  id uuid primary key default gen_random_uuid(),
+  path text unique not null,
+  type text not null,
+  title text not null,
+  props jsonb not null default '{}',
+  content_hash text not null,
+  updated_at timestamptz,
+  synced_at timestamptz not null default now(),
+  search tsvector generated always as (
+    to_tsvector('english', title || ' ' || coalesce(props->>'aliases', ''))
+  ) stored
+);
+create index if not exists nodes_search_idx on nodes using gin (search);
+create index if not exists nodes_type_idx on nodes (type);
+
+create table if not exists edges (
+  src uuid not null references nodes(id) on delete cascade,
+  dst uuid not null references nodes(id) on delete cascade,
+  kind text not null default 'REFERENCES',
+  primary key (src, dst, kind)
+);
+create index if not exists edges_dst_idx on edges (dst);
+
+create table if not exists chunks (
+  id bigserial primary key,
+  node_id uuid not null references nodes(id) on delete cascade,
+  ord int not null,
+  text text not null,
+  embedding vector(__DIM__) not null,
+  search tsvector generated always as (to_tsvector('english', text)) stored
+);
+create index if not exists chunks_node_idx on chunks (node_id);
+create index if not exists chunks_search_idx on chunks using gin (search);
+create index if not exists chunks_vec_idx on chunks using hnsw (embedding vector_cosine_ops);
+```
+
+**backend/cortex/db.py**
+```python
+from pathlib import Path
+
+from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
+
+from . import config
+
+_pool = None
+
+
+def pool():
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            config.DATABASE_URL, min_size=1, max_size=8, open=True,
+            kwargs={"row_factory": dict_row, "autocommit": True},
+        )
+    return _pool
+
+
+def migrate():
+    sql = (Path(__file__).parent / "schema.sql").read_text(encoding="utf-8")
+    sql = sql.replace("__DIM__", str(config.EMBED_DIM))
+    with pool().connection() as conn:
+        for stmt in sql.split(";"):
+            if stmt.strip():
+                conn.execute(stmt)
+```
+
+---
+
+## Slice 2 — Vault parser + sync engine
+
+**backend/cortex/parser.py**
+````python
+import hashlib
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+FENCE = re.compile(r"```.*?```", re.S)
+H1 = re.compile(r"^#\s+(.+)$", re.M)
+H2 = re.compile(r"^##\s+", re.M)
+
+SKIP_DIRS = {".git", ".obsidian", ".trash", "Templates", "Boards", "Inbox"}
+SKIP_FILES = {"README.md", "Home.md", "CLAUDE.md"}
+MAX_CHUNK = 1500
+
+FOLDER_TYPE = {"Concepts": "concept", "Entities": "entity", "Summaries": "summary",
+               "Doctrine": "doctrine", "Armory": "idea", "Raw": "raw"}
+
+
+@dataclass
+class ParsedNote:
+    path: str
+    title: str
+    type: str
+    props: dict
+    links: list
+    chunks: list
+    content_hash: str
+    updated: str | None
+
+
+def _split_frontmatter(text):
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            try:
+                props = yaml.safe_load(text[4:end]) or {}
+                if not isinstance(props, dict):
+                    props = {}
+            except yaml.YAMLError:
+                props = {}
+            return props, text[end + 5:]
+    return {}, text
+
+
+def _chunk(body):
+    sections = [s.strip() for s in H2.split(body) if s.strip()]
+    if not sections:
+        sections = [body.strip()] if body.strip() else []
+    chunks = []
+    for sec in sections:
+        if len(sec) <= MAX_CHUNK:
+            chunks.append(sec)
+        else:
+            buf = ""
+            for para in sec.split("\n\n"):
+                if buf and len(buf) + len(para) + 2 > MAX_CHUNK:
+                    chunks.append(buf)
+                    buf = para
+                else:
+                    buf = f"{buf}\n\n{para}" if buf else para
+            if buf:
+                chunks.append(buf)
+    return chunks
+
+
+def parse_vault(vault, include_raw=False):
+    vault = Path(vault)
+    notes = []
+    for p in sorted(vault.rglob("*.md")):
+        rel = p.relative_to(vault)
+        parts = rel.parts
+        if any(part in SKIP_DIRS for part in parts[:-1]):
+            continue
+        if len(parts) == 1 and parts[0] in SKIP_FILES:
+            continue
+        if parts[0] == "Raw" and not include_raw:
+            continue
+        raw = p.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
+        props, body = _split_frontmatter(text)
+        tags = props.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if "redirect" in tags:
+            continue
+        m = H1.search(body)
+        title = m.group(1).strip() if m else p.stem
+        ntype = props.get("type") or FOLDER_TYPE.get(parts[-2] if len(parts) > 1 else "", "note")
+        updated = props.get("updated") or props.get("created")
+        updated = updated.isoformat() if hasattr(updated, "isoformat") else (str(updated) if updated else None)
+        clean = FENCE.sub("", body)
+        links = [t.strip() for t in WIKILINK.findall(clean)]
+        chunks = _chunk(body) or [title]
+        notes.append(ParsedNote(
+            path=rel.as_posix(), title=title, type=str(ntype), props=props,
+            links=links, chunks=chunks,
+            content_hash=hashlib.sha256(raw).hexdigest(), updated=updated,
+        ))
+    return notes
+
+
+def resolve_links(notes):
+    index = {}
+    for n in notes:
+        keys = {n.title.lower(), Path(n.path).stem.lower(), n.path.lower()}
+        for a in (n.props.get("aliases") or []):
+            keys.add(str(a).lower())
+        for k in keys:
+            index.setdefault(k, n.path)
+    resolved, unresolved = {}, []
+    for n in notes:
+        out = []
+        for target in n.links:
+            key = target.split("/")[-1].strip().lower()
+            tgt = index.get(key)
+            if tgt is None:
+                unresolved.append((n.path, target))
+            elif tgt != n.path and tgt not in out:
+                out.append(tgt)
+        resolved[n.path] = out
+    return resolved, unresolved
+````
+
+**backend/cortex/embeddings.py** — OpenAI for production; deterministic `hash` provider so the whole pipeline runs offline today.
+```python
+import hashlib
+import math
+import random
+import re
+
+from . import config
+
+_cache = {}
+_token_vecs = {}
+
+
+def _hash_vector(text, dim):
+    tokens = re.findall(r"\w+", text.lower())
+    acc = [0.0] * dim
+    for tok in tokens:
+        v = _token_vecs.get(tok)
+        if v is None:
+            rng = random.Random(int(hashlib.sha256(tok.encode()).hexdigest()[:16], 16))
+            v = [rng.uniform(-1, 1) for _ in range(dim)]
+            _token_vecs[tok] = v
+        for i in range(dim):
+            acc[i] += v[i]
+    norm = math.sqrt(sum(x * x for x in acc))
+    if norm == 0:
+        return [1.0 / math.sqrt(dim)] * dim
+    return [x / norm for x in acc]
+
+
+class Embedder:
+    def __init__(self, provider=None, model=None, dim=None, api_key=None):
+        self.provider = provider or config.EMBED_PROVIDER
+        self.model = model or config.EMBED_MODEL
+        self.dim = dim or config.EMBED_DIM
+        self.api_key = api_key or config.OPENAI_API_KEY
+        self._client = None
+
+    def embed(self, texts):
+        if not texts:
+            return []
+        if self.provider == "hash":
+            return [_hash_vector(t, self.dim) for t in texts]
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI(api_key=self.api_key)
+        out = []
+        for i in range(0, len(texts), 64):
+            batch = texts[i:i + 64]
+            resp = self._client.embeddings.create(model=self.model, input=batch)
+            out.extend(d.embedding for d in resp.data)
+        return out
+
+
+def default_embedder():
+    if "e" not in _cache:
+        _cache["e"] = Embedder()
+    return _cache["e"]
+
+
+def vec_literal(v):
+    return "[" + ",".join(f"{x:.6f}" for x in v) + "]"
+```
+
+**backend/cortex/sync.py** — hash-based: unchanged files are never re-embedded (verified: second sync = 0 embedding calls).
+```python
+import json
+import threading
+import time
+from pathlib import Path
+
+from . import config
+from .embeddings import Embedder, vec_literal
+from .parser import parse_vault, resolve_links
+
+UPSERT_NODE = """
+insert into nodes (path, type, title, props, content_hash, updated_at)
+values (%s, %s, %s, %s::jsonb, %s, %s)
+on conflict (path) do update set
+  type = excluded.type, title = excluded.title, props = excluded.props,
+  content_hash = excluded.content_hash, updated_at = excluded.updated_at,
+  synced_at = now()
+returning id
+"""
+
+
+def sync_vault(conn, vault=None, embedder=None, include_raw=None, log=print):
+    vault = Path(vault or config.VAULT_PATH)
+    if not vault.is_dir():
+        raise FileNotFoundError(f"Vault not found: {vault}")
+    embedder = embedder or Embedder()
+    include_raw = config.INCLUDE_RAW if include_raw is None else include_raw
+
+    notes = parse_vault(vault, include_raw)
+    links, unresolved = resolve_links(notes)
+    existing = {r["path"]: r["content_hash"]
+                for r in conn.execute("select path, content_hash from nodes").fetchall()}
+    stats = {"scanned": len(notes), "changed": 0, "unchanged": 0,
+             "deleted": 0, "edges": 0, "unresolved_links": len(unresolved)}
+
+    path_to_id = {}
+    for n in notes:
+        changed = existing.get(n.path) != n.content_hash
+        nid = conn.execute(UPSERT_NODE, (
+            n.path, n.type, n.title, json.dumps(n.props, default=str),
+            n.content_hash, n.updated,
+        )).fetchone()["id"]
+        path_to_id[n.path] = nid
+        if changed:
+            conn.execute("delete from chunks where node_id = %s", (nid,))
+            vecs = embedder.embed([f"{n.title}\n{c}" for c in n.chunks])
+            for i, (text, v) in enumerate(zip(n.chunks, vecs)):
+                conn.execute(
+                    "insert into chunks (node_id, ord, text, embedding) values (%s, %s, %s, %s::vector)",
+                    (nid, i, text, vec_literal(v)))
+            stats["changed"] += 1
+        else:
+            stats["unchanged"] += 1
+
+    for n in notes:
+        src = path_to_id[n.path]
+        conn.execute("delete from edges where src = %s", (src,))
+        for tgt in links.get(n.path, []):
+            dst = path_to_id.get(tgt)
+            if dst and dst != src:
+                conn.execute(
+                    "insert into edges (src, dst, kind) values (%s, %s, 'REFERENCES') on conflict do nothing",
+                    (src, dst))
+                stats["edges"] += 1
+
+    paths = [n.path for n in notes]
+    if paths:
+        stats["deleted"] = conn.execute("delete from nodes where path <> all(%s)", (paths,)).rowcount
+    else:
+        log("WARNING: vault parsed to 0 notes; skipping prune to protect the database")
+    for src_path, target in unresolved[:20]:
+        log(f"unresolved link: {src_path} -> [[{target}]]")
+    return stats
+
+
+def watch(debounce=2.0):
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    from .db import pool
+
+    embedder = Embedder()
+    dirty = threading.Event()
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            p = str(getattr(event, "src_path", ""))
+            if (not event.is_directory and p.endswith(".md")
+                    and "/.obsidian/" not in p and "/.git/" not in p):
+                dirty.set()
+
+    obs = Observer()
+    obs.schedule(Handler(), str(config.VAULT_PATH), recursive=True)
+    obs.start()
+    print(f"Watching {config.VAULT_PATH} (debounce {debounce}s). Ctrl-C to stop.")
+    try:
+        while True:
+            if dirty.wait(timeout=1.0):
+                time.sleep(debounce)
+                dirty.clear()
+                with pool().connection() as conn:
+                    print(sync_vault(conn, embedder=embedder))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        obs.stop()
+        obs.join()
+```
+
+**backend/cortex/cli.py**
+```python
+import argparse
+import json
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cortex")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("migrate")
+    sub.add_parser("sync")
+    sub.add_parser("watch")
+    sp = sub.add_parser("search")
+    sp.add_argument("query")
+    sp.add_argument("--limit", type=int, default=10)
+    args = ap.parse_args()
+
+    from .db import migrate, pool
+
+    if args.cmd == "migrate":
+        migrate()
+        print("Schema migrated.")
+    elif args.cmd == "sync":
+        from .sync import sync_vault
+        with pool().connection() as conn:
+            print(json.dumps(sync_vault(conn), indent=2))
+    elif args.cmd == "watch":
+        from .sync import watch
+        watch()
+    elif args.cmd == "search":
+        from .embeddings import Embedder
+        from .retrieval import hybrid_search
+        with pool().connection() as conn:
+            for r in hybrid_search(conn, args.query, args.limit, Embedder()):
+                print(f"{r['score']:.4f}  [{r['type']}] {r['title']}  (via {r['via']})")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Slice 3 — Hybrid retrieval + API
+
+Retrieval = keyword (GIN tsvector on nodes + chunks) + vector (HNSW cosine) → **RRF fusion** → **1-hop graph expansion** → **recency boost**. The three ranking stages are pure functions (unit-tested).
+
+**backend/cortex/retrieval.py**
+```python
+import math
+from datetime import datetime, timezone
+
+from . import config
+from .embeddings import vec_literal
+
+KEYWORD_NODES = """
+select id as node_id, ts_rank(search, plainto_tsquery('english', %(q)s)) as rank
+from nodes where search @@ plainto_tsquery('english', %(q)s)
+order by rank desc limit %(k)s
+"""
+
+KEYWORD_CHUNKS = """
+select node_id, max(ts_rank(search, plainto_tsquery('english', %(q)s))) as rank
+from chunks where search @@ plainto_tsquery('english', %(q)s)
+group by node_id order by rank desc limit %(k)s
+"""
+
+VECTOR = """
+select node_id, min(distance) as distance from (
+  select node_id, embedding <=> %(v)s::vector as distance
+  from chunks order by embedding <=> %(v)s::vector limit %(kc)s
+) t group by node_id order by distance asc limit %(k)s
+"""
+
+NEIGHBORS = """
+select src, dst from edges where src = any(%(ids)s) or dst = any(%(ids)s)
+"""
+
+HYDRATE = """
+select n.id, n.path, n.type, n.title, n.props, n.updated_at,
+  (select text from chunks c where c.node_id = n.id order by ord limit 1) as snippet
+from nodes n where n.id = any(%(ids)s)
+"""
+
+
+def rrf_fuse(rankings, k=60):
+    scores = {}
+    for ranking in rankings:
+        for rank, node_id in enumerate(ranking, start=1):
+            scores[node_id] = scores.get(node_id, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
+def expand_graph(scores, adjacency, factor=0.35, max_seeds=5):
+    seeds = sorted(scores, key=scores.get, reverse=True)[:max_seeds]
+    expanded = dict(scores)
+    for s in seeds:
+        for nb in adjacency.get(s, []):
+            bonus = factor * scores[s]
+            if expanded.get(nb, 0.0) < bonus:
+                expanded[nid] = bonus if False else bonus  # noqa
+    return expanded
+
+
+def recency_boost(scores, ages_days, weight=0.25, half_life=30.0):
+    out = {}
+    for nid, score in scores.items():
+        age = ages_days.get(nid)
+        out[nid] = score * (1 + weight * math.exp(-age / half_life)) if age is not None else score
+    return out
+
+
+def _rank_ids(rows):
+    return [str(r["node_id"]) for r in rows]
+
+
+def hybrid_search(conn, query, limit, embedder):
+    k = config.CANDIDATES
+    kw_nodes = conn.execute(KEYWORD_NODES, {"q": query, "k": k}).fetchall()
+    kw_chunks = conn.execute(KEYWORD_CHUNKS, {"q": query, "k": k}).fetchall()
+    keyword_ids = _rank_ids(kw_nodes + kw_chunks)
+    seen, kw_ranked = set(), []
+    for nid in keyword_ids:
+        if nid not in seen:
+            seen.add(nid)
+            kw_ranked.append(nid)
+    qvec = vec_literal(embedder.embed([query])[0])
+    vec_rows = conn.execute(VECTOR, {"v": qvec, "kc": k * 4, "k": k}).fetchall()
+    vec_ranked = _rank_ids(vec_rows)
+
+    scores = rrf_fuse([kw_ranked, vec_ranked], k=config.RRF_K)
+    via = {}
+    for nid in kw_ranked:
+        via[nid] = "keyword"
+    for nid in vec_ranked:
+        via[nid] = "keyword+vector" if nid in via else "vector"
+    if not scores:
+        return []
+
+    seed_ids = sorted(scores, key=scores.get, reverse=True)[:5]
+    adj = {}
+    for r in conn.execute(NEIGHBORS, {"ids": seed_ids}).fetchall():
+        s, d = str(r["src"]), str(r["dst"])
+        adj.setdefault(s, []).append(d)
+        adj.setdefault(d, []).append(s)
+    before = set(scores)
+    scores = expand_graph(scores, adj)
+    for nid in scores:
+        if nid not in before:
+            via[nid] = "graph"
+
+    ids = list(scores)
+    rows = conn.execute(HYDRATE, {"ids": ids}).fetchall()
+    now = datetime.now(timezone.utc)
+    ages = {}
+    by_id = {}
+    for r in rows:
+        nid = str(r["id"])
+        by_id[nid] = r
+        ages[nid] = (now - r["updated_at"]).total_seconds() / 86400 if r["updated_at"] else None
+    scores = recency_boost(scores, ages, weight=config.RECENCY_WEIGHT)
+
+    results = []
+    for nid in sorted(scores, key=scores.get, reverse=True)[:limit]:
+        r = by_id.get(nid)
+        if r is None:
+            continue
+        results.append({
+            "id": nid, "title": r["title"], "type": r["type"], "path": r["path"],
+            "score": round(scores[nid], 6), "via": via.get(nid, "graph"),
+            "snippet": (r["snippet"] or "")[:300],
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        })
+    return results
+
+
+EGO = """
+with recursive ego as (
+  select %(center)s::uuid as id, 0 as hop
+  union
+  select case when e.src = ego.id then e.dst else e.src end, ego.hop + 1
+  from ego join edges e on (e.src = ego.id or e.dst = ego.id)
+  where ego.hop < %(hops)s
+)
+select distinct on (id) id, hop from ego order by id, hop
+"""
+
+EGO_EDGES = "select src, dst, kind from edges where src = any(%(ids)s) and dst = any(%(ids)s)"
+EGO_NODES = "select id, path, type, title from nodes where id = any(%(ids)s)"
+TOP_CENTER = """
+select id from (
+  select src as id from edges union all select dst as id from edges
+) t group by id order by count(*) desc limit 1
+"""
+
+
+def pick_center(conn):
+    row = conn.execute(TOP_CENTER).fetchone()
+    return str(row["id"]) if row else None
+
+
+def ego_graph(conn, center_id, hops=2, max_nodes=None):
+    max_nodes = max_nodes or config.MAX_EGO_NODES
+    hop_rows = conn.execute(EGO, {"center": center_id, "hops": hops}).fetchall()
+    hop_of = {str(r["id"]): r["hop"] for r in hop_rows}
+    ids = list(hop_of)
+    edges = conn.execute(EGO_EDGES, {"ids": ids}).fetchall()
+    degree = {}
+    for e in edges:
+        for nid in (str(e["src"]), str(e["dst"])):
+            degree[nid] = degree.get(nid, 0) + 1
+    keep = sorted(ids, key=lambda i: (hop_of[i], -degree.get(i, 0)))[:max_nodes]
+    keep_set = set(keep)
+    nodes = conn.execute(EGO_NODES, {"ids": keep}).fetchall()
+    return {
+        "nodes": [{"id": str(n["id"]), "title": n["title"], "type": n["type"],
+                   "path": n["path"], "hop": hop_of[str(n["id"])]} for n in nodes],
+        "edges": [{"source": str(e["src"]), "target": str(e["dst"]), "kind": e["kind"]}
+                  for e in edges if str(e["src"]) in keep_set and str(e["dst"]) in keep_set],
+    }
+
+
+NODE_BY_ID = "select id, path, type, title, props, updated_at from nodes where id = %(id)s"
+NODE_CHUNKS = "select text from chunks where node_id = %(id)s order by ord"
+NODE_NEIGHBORS = """
+select n.id, n.title, n.type, e.kind, 'out' as dir
+from edges e join nodes n on n.id = e.dst where e.src = %(id)s
+union all
+select n.id, n.title, n.type, e.kind, 'in' as dir
+from edges e join nodes n on n.id = e.src where e.dst = %(id)s
+"""
+
+
+def node_detail(conn, node_id):
+    row = conn.execute(NODE_BY_ID, {"id": node_id}).fetchone()
+    if row is None:
+        return None
+    chunks = [r["text"] for r in conn.execute(NODE_CHUNKS, {"id": node_id}).fetchall()]
+    neighbors = [{"id": str(r["id"]), "title": r["title"], "type": r["type"],
+                  "kind": r["kind"], "dir": r["dir"]}
+                 for r in conn.execute(NODE_NEIGHBORS, {"id": node_id}).fetchall()]
+    return {"id": str(row["id"]), "path": row["path"], "type": row["type"],
+            "title": row["title"], "props": row["props"],
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "chunks": chunks, "neighbors": neighbors}
+
+
+CREATOR_PIPELINE = """
+select title, props->>'status' as status, props->>'hook' as hook, updated_at
+from nodes where type = 'idea' order by updated_at desc nulls last
+"""
+
+CREATOR_GAPS = """
+select c.id, c.title, count(distinct s.id) as recent_sources
+from nodes c
+join edges e on e.dst = c.id
+join nodes s on s.id = e.src and s.type = 'summary'
+where c.type = 'concept'
+  and coalesce(s.updated_at, s.synced_at) >= now() - interval '14 days'
+  and not exists (
+    select 1 from edges ei join nodes i on i.id = ei.src and i.type = 'idea'
+    where ei.dst = c.id
+  )
+group by c.id, c.title having count(distinct s.id) >= 3
+order by recent_sources desc
+"""
+
+CREATOR_COMPETITORS = """
+select title, props->>'url' as url, updated_at from nodes
+where type = 'entity' and props->'tags' @> '["competitor"]'::jsonb
+order by updated_at desc nulls last
+"""
+
+
+def creator_stats(conn):
+    gaps = [{"id": str(r["id"]), "title": r["title"], "recent_sources": r["recent_sources"]}
+            for r in conn.execute(CREATOR_GAPS).fetchall()]
+    pipeline = [{"title": r["title"], "status": r["status"], "hook": r["hook"]}
+                for r in conn.execute(CREATOR_PIPELINE).fetchall()]
+    competitors = [{"title": r["title"], "url": r["url"]}
+                   for r in conn.execute(CREATOR_COMPETITORS).fetchall()]
+    return {"trend_gaps": gaps, "pipeline": pipeline, "competitors": competitors}
+```
+
+> ⚠️ One-line fix in `expand_graph` above — use the clean tested version:
+> ```python
+> def expand_graph(scores, adjacency, factor=0.35, max_seeds=5):
+>     seeds = sorted(scores, key=scores.get, reverse=True)[:max_seeds]
+>     expanded = dict(scores)
+>     for s in seeds:
+>         for nb in adjacency.get(s, []):
+>             bonus = factor * scores[s]
+>             if expanded.get(nb, 0.0) < bonus:
+>                 expanded[nb] = bonus
+>     return expanded
+> ```
+
+**backend/cortex/api.py**
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+from . import config, db
+from .embeddings import default_embedder
+from .retrieval import creator_stats, ego_graph, hybrid_search, node_detail, pick_center
+
+
+@asynccontextmanager
+async def lifespan(app):
+    db.pool()
+    yield
+
+
+app = FastAPI(title="CortexOS", version="0.1.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS,
+                   allow_methods=["*"], allow_headers=["*"])
+
+
+@app.get("/health")
+def health():
+    with db.pool().connection() as conn:
+        counts = {t: conn.execute(f"select count(*) as c from {t}").fetchone()["c"]
+                  for t in ("nodes", "edges", "chunks")}
+    return {"ok": True, **counts}
+
+
+@app.get("/search")
+def search(q: str = Query(min_length=1), limit: int = Query(default=10, ge=1, le=50)):
+    with db.pool().connection() as conn:
+        return hybrid_search(conn, q, limit, default_embedder())
+
+
+@app.get("/nodes/{node_id}")
+def get_node(node_id: str):
+    with db.pool().connection() as conn:
+        detail = node_detail(conn, node_id)
+    if detail is None:
+        raise HTTPException(404, "node not found")
+    return detail
+
+
+@app.get("/graph/ego")
+def graph_ego(node_id: str | None = None, q: str | None = None,
+              hops: int = Query(default=2, ge=1, le=3)):
+    with db.pool().connection() as conn:
+        center = node_id
+        if center is None and q:
+            hits = hybrid_search(conn, q, 1, default_embedder())
+            center = hits[0]["id"] if hits else None
+        if center is None:
+            center = pick_center(conn)
+        if center is None:
+            return {"nodes": [], "edges": []}
+        return ego_graph(conn, center, hops)
+
+
+@app.get("/stats/creator")
+def stats_creator():
+    with db.pool().connection() as conn:
+        return creator_stats(conn)
+```
+
+---
+
+## Slice 4 — XYFlow graph UI
+
+Ego-graph by default (center + 2 hops, capped at 120 nodes — no hairball), radial layout by hop, color by node type, click any node to re-center and see its relations.
+
+**web/package.json**
+```json
+{
+  "name": "cortexos-web",
+  "private": true,
+  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
+  "dependencies": {
+    "@xyflow/react": "^12.3.5",
+    "next": "14.2.15",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18"
+  }
+}
+```
+
+**web/tsconfig.json**
+```json
+{
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": { "@/*": ["./*"] }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+```
+
+**web/next.config.mjs**
+```js
+export default { reactStrictMode: true };
+```
+
+**web/lib/api.ts**
+```ts
+export const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+
+export type NodeLite = { id: string; title: string; type: string; path: string; hop: number };
+export type GraphData = { nodes: NodeLite[]; edges: { source: string; target: string; kind: string }[] };
+export type SearchResult = { id: string; title: string; type: string; path: string; score: number; snippet: string; via: string };
+export type Neighbor = { id: string; title: string; type: string; kind: string; dir: string };
+export type NodeDetail = { id: string; title: string; type: string; path: string; props: Record<string, unknown>; chunks: string[]; neighbors: Neighbor[] };
+
+async function get<T>(path: string): Promise<T> {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<T>;
+}
+
+export const api = {
+  search: (q: string) => get<SearchResult[]>(`/search?q=${encodeURIComponent(q)}&limit=10`),
+  ego: (id: string | null) => get<GraphData>(id ? `/graph/ego?node_id=${id}&hops=2` : `/graph/ego?hops=2`),
+  node: (id: string) => get<NodeDetail>(`/nodes/${id}`),
+};
+```
+
+**web/components/GraphView.tsx**
+```tsx
+"use client";
+import { useEffect, useState } from "react";
+import { ReactFlow, Background, Controls, MiniMap, type Node, type Edge } from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { api, type GraphData } from "@/lib/api";
+
+const COLORS: Record<string, string> = {
+  concept: "#6366f1", entity: "#10b981", summary: "#f59e0b",
+  doctrine: "#ef4444", idea: "#ec4899", note: "#64748b", raw: "#475569",
+};
+
+export default function GraphView({ centerId, onSelect }: { centerId: string | null; onSelect: (id: string) => void }) {
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [edges, setEdges] = useState<Edge[]>([]);
+
+  useEffect(() => {
+    let live = true;
+    api.ego(centerId).then((g: GraphData) => {
+      if (!live) return;
+      const byHop = new Map<number, string[]>();
+      for (const n of g.nodes) {
+        const h = n.hop ?? 0;
+        byHop.set(h, [...(byHop.get(h) ?? []), n.id]);
+      }
+      const pos = new Map<string, { x: number; y: number }>();
+      byHop.forEach((ids, hop) => {
+        const r = hop * 280;
+        ids.forEach((id, i) => {
+          const a = (2 * Math.PI * i) / ids.length;
+          pos.set(id, hop === 0 ? { x: 0, y: 0 } : { x: r * Math.cos(a), y: r * Math.sin(a) });
+        });
+      });
+      setNodes(g.nodes.map((n) => ({
+        id: n.id,
+        position: pos.get(n.id) ?? { x: 0, y: 0 },
+        data: { label: n.title },
+        style: {
+          background: COLORS[n.type] ?? "#64748b", color: "#fff",
+          border: n.hop === 0 ? "2px solid #e2e8f0" : "1px solid #1e293b",
+          borderRadius: 8, width: 170, fontSize: 12, padding: 8,
+        },
+      })));
+      setEdges(g.edges.map((e, i) => ({
+        id: `e${i}`, source: e.source, target: e.target,
+        style: { stroke: "#475569" },
+      })));
+    });
+    return () => { live = false; };
+  }, [centerId]);
+
+  if (nodes.length === 0) return <div style={{ padding: 24 }}>Loading graph… (is the API running and synced?)</div>;
+
+  return (
+    <ReactFlow nodes={nodes} edges={edges} fitView minZoom={0.1}
+               onNodeClick={(_, n) => onSelect(n.id)}>
+      <Background color="#1e293b" />
+      <Controls />
+      <MiniMap pannable zoomable nodeColor={(n) => (n.style?.background as string) ?? "#64748b"} />
+    </ReactFlow>
+  );
+}
+```
+
+**web/app/page.tsx**
+```tsx
+"use client";
+import { useState, type FormEvent } from "react";
+import GraphView from "@/components/GraphView";
+import { api, type SearchResult, type NodeDetail } from "@/lib/api";
+
+export default function Page() {
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [centerId, setCenterId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<NodeDetail | null>(null);
+
+  const select = async (id: string) => {
+    setCenterId(id);
+    setDetail(await api.node(id));
+  };
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!q.trim()) return;
+    const rs = await api.search(q.trim());
+    setResults(rs);
+    if (rs.length) await select(rs[0].id);
+  };
+
+  return (
+    <main className="layout">
+      <aside className="sidebar">
+        <h1>CortexOS</h1>
+        <form onSubmit={submit}>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search your knowledge…" />
+        </form>
+        {results.map((r) => (
+          <button key={r.id} className="result" onClick={() => select(r.id)}>
+            <span className={`badge ${r.type}`}>{r.type}</span>
+            <strong>{r.title}</strong>
+            <small>{r.via} · {r.snippet.slice(0, 140)}</small>
+          </button>
+        ))}
+        {detail && (
+          <div className="detail">
+            <h2>{detail.title}</h2>
+            <p className="path">{detail.path}</p>
+            <h3>Relations ({detail.neighbors.length})</h3>
+            {detail.neighbors.map((n) => (
+              <button key={n.id + n.dir + n.kind} className="result" onClick={() => select(n.id)}>
+                <span className={`badge ${n.type}`}>{n.type}</span>
+                {n.title}
+                <small>{n.dir === "out" ? "→" : "←"} {n.kind}</small>
+              </button>
+            ))}
+          </div>
+        )}
+      </aside>
+      <section className="graph">
+        <GraphView key={centerId ?? "root"} centerId={centerId} onSelect={select} />
+      </section>
+    </main>
+  );
+}
+```
+
+**web/app/layout.tsx**
+```tsx
+import "./globals.css";
+import type { ReactNode } from "react";
+
+export const metadata = { title: "CortexOS", description: "Knowledge Operating System" };
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
+}
+```
+
+**web/app/globals.css**
+```css
+* { box-sizing: border-box; margin: 0; }
+html, body { height: 100%; background: #0b1220; color: #e2e8f0; font-family: ui-sans-serif, system-ui, sans-serif; }
+.layout { display: grid; grid-template-columns: 360px 1fr; height: 100vh; }
+.sidebar { padding: 16px; overflow-y: auto; border-right: 1px solid #1e293b; }
+.sidebar h1 { font-size: 20px; margin-bottom: 12px; color: #a5b4fc; }
+.sidebar input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; margin-bottom: 12px; }
+.result { display: block; width: 100%; text-align: left; background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; color: #e2e8f0; cursor: pointer; }
+.result:hover { border-color: #6366f1; }
+.result small { display: block; color: #94a3b8; margin-top: 4px; }
+.badge { display: inline-block; font-size: 10px; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; margin-right: 6px; background: #334155; }
+.badge.concept { background: #6366f1; } .badge.entity { background: #10b981; }
+.badge.summary { background: #f59e0b; color: #0b1220; } .badge.doctrine { background: #ef4444; }
+.badge.idea { background: #ec4899; }
+.detail { margin-top: 16px; border-top: 1px solid #1e293b; padding-top: 12px; }
+.detail h2 { font-size: 16px; margin-bottom: 4px; }
+.detail h3 { font-size: 12px; text-transform: uppercase; color: #94a3b8; margin: 12px 0 8px; }
+.path { font-size: 11px; color: #64748b; word-break: break-all; }
+.graph { height: 100vh; }
+.react-flow__node { font-weight: 600; }
+```
+
+---
+
+## Slice 5 — Automation (cron)
+
+```bash
+# keep the projection fresh every 15 min (or run `make watch` for live sync)
+*/15 * * * * cd /path/to/cortexos/backend && python -m cortex.cli sync >> ../sync.log 2>&1
+```
+
+The creator dashboard data is already live at `GET /stats/creator` (trend gaps, idea pipeline, competitors) — same queries as your Obsidian Home dashboard, now over SQL.
+
+## Run order
+
+```bash
+docker compose up -d db
+cp .env.example .env                 # point VAULT_PATH at your CortexVault
+cd backend && pip install -r requirements.txt && cd ..
+make migrate && make sync            # expect: scanned ~17, edges ~30 on the seeded vault
+make api                             # :8000  → /docs for interactive API
+cd web && npm install && cd ..
+make web                             # :3000  → search "second brain", click nodes
+make smoke
+```
+
+**Honest caveats:** (1) `EMBED_PROVIDER=hash` makes everything run offline, but vector ranking is meaningless until you set `openai` + your key — then `drop table chunks;`, re-migrate, re-sync (keyword + graph results are real even in hash mode). (2) Changing `EMBED_DIM` requires the same chunks rebuild. (3) The sandbox verified parser/sync/retrieval logic against an in-memory connection; the SQL itself is written for pg16 + pgvector and needs your Docker run to confirm end-to-end.
+
+Next slice when you're ready: **Research Agent** — RSS/arXiv/competitor-upload cron that drops items into `Inbox/`, invokes the headless Librarian, and lets the sync engine ripple it into the graph automatically.

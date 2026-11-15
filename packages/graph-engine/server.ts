@@ -20,6 +20,8 @@ export {
   extractKnowledgeWithAiOrFallback,
   linkAndIndexNode,
   computeLineLocator,
+  extractExplicitWikiLinks,
+  resolveOrCreateNodeByName,
 } from "./services/linker";
 export { hybridGraphSearch } from "./services/search";
 export {
@@ -27,5 +29,18 @@ export {
   generateNodeContextAnswer,
 } from "./services/ai-context";
 export { seedDefaultGraphIfEmpty } from "./services/seed";
+export {
+  loadVaultNotes,
+  parseFrontmatterAndBody,
+  syncVaultToDatabase,
+  exportVaultRepoBrainJson,
+} from "./services/vault-sync";
+export {
+  getTrendGapWidget,
+  getCompetitorCoverageMatrix,
+  getCreatorPipelineBoard,
+  getCreatorDashboardData,
+  getFilteredEgoGraph,
+} from "./api/creator-widgets";
 export { createGraphApiHandlers } from "./api/handlers";
 export type { GraphAuthGuard, GraphApiConfig } from "./api/handlers";

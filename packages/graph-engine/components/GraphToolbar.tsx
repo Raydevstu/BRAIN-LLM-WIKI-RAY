@@ -8,9 +8,11 @@ import {
   ChevronDown,
   ChevronUp,
   Circle,
+  Compass,
   Eye,
   Filter,
   Focus,
+  FolderSync,
   GitFork,
   Layers,
   Pause,
@@ -69,6 +71,10 @@ export function GraphToolbar({
     viewAngle,
     setViewAngle,
     triggerCameraReset,
+    creatorDrawerOpen,
+    setCreatorDrawerOpen,
+    syncVault,
+    isSyncingVault,
   } = useGraph();
 
   const [dockCollapsed, setDockCollapsed] = useState(false);
@@ -86,8 +92,30 @@ export function GraphToolbar({
           </span>
         </div>
 
-        <div className="pointer-events-auto flex items-center gap-3">
+        <div className="pointer-events-auto flex items-center gap-2.5">
           <GraphSearch />
+          <button
+            type="button"
+            onClick={() => setCreatorDrawerOpen((v) => !v)}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
+              creatorDrawerOpen
+                ? "border-sky-500/60 bg-sky-500/20 text-sky-200"
+                : "border-slate-700/80 bg-slate-900/95 text-slate-200 hover:border-slate-600 hover:text-white"
+            }`}
+          >
+            <Compass className="h-3.5 w-3.5" />
+            <span className="hidden md:inline">Creator OS</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => syncVault({ enableAiEnrichment: false }).catch(() => {})}
+            disabled={isSyncingVault}
+            title="Sync ./CortexVault Markdown notes into PGlite"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700/80 bg-slate-900/95 px-3 py-1.5 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 transition-colors hover:border-emerald-500/60 hover:text-emerald-200 disabled:opacity-50"
+          >
+            <FolderSync className={`h-3.5 w-3.5 ${isSyncingVault ? "animate-spin" : ""}`} />
+            <span className="hidden lg:inline">{isSyncingVault ? "Syncing..." : "Sync Vault"}</span>
+          </button>
           {onOpenCreateModal && (
             <button
               type="button"

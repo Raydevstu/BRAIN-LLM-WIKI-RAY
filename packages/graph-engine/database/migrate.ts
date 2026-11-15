@@ -66,11 +66,26 @@ async function runMigrations(exec: QueryExecutor): Promise<void> {
     await exec.exec(PGLITE_VECTOR_SHIM_SQL);
   }
 
+  // Safely upgrade pre-existing databases enum values first
+  for (const val of ["source", "doctrine", "idea"]) {
+    try {
+      await exec.exec(
+        `ALTER TYPE graph_node_kind ADD VALUE IF NOT EXISTS '${val}';`
+      );
+    } catch {
+      // Ignore if type does not exist yet (schema.sql will create it)
+    }
+  }
+
   let ddl = loadSchemaSql();
   if (!isRemotePostgresUrl()) {
     ddl = ddl.replace(/vector\(1536\)/g, "vector");
   }
   await exec.exec(ddl);
+
+  await exec.exec(`
+    CREATE INDEX IF NOT EXISTS graph_nodes_lower_title_trgm_idx ON graph_nodes USING gin (lower(title) gin_trgm_ops);
+  `);
 
   if (isRemotePostgresUrl()) {
     await exec.exec(`

@@ -21,6 +21,9 @@ export type GraphNodeKind =
   | "concept"
   | "wiki_page"
   | "collection"
+  | "source"
+  | "doctrine"
+  | "idea"
   | "custom";
 
 export type GraphEdgeType =
@@ -33,6 +36,8 @@ export type GraphEdgeType =
   | "authored_by"
   | "belongs_to"
   | "relates_to"
+  | "references"
+  | "cited_in_source"
   | "supersedes";
 
 export type ReviewState = "proposed" | "approved" | "rejected";
@@ -82,13 +87,16 @@ export interface ClusterHubConfig {
 
 export interface GraphNode {
   id: string;
+  vaultPath?: string | null;
   title: string;
   category: string;
   kind: GraphNodeKind;
   cluster: string;
   summary: string;
   content: string;
+  aliases?: string[];
   tags: string[];
+  props?: Record<string, unknown>;
   connections: string[];
   stalenessDays: number;
   needsAttention: boolean;
@@ -150,6 +158,8 @@ export interface GraphSearchCitation {
   claimText: string;
 }
 
+export type SearchProvenance = "keyword" | "vector" | "keyword+vector" | "graph";
+
 export interface GraphSearchResult {
   nodeId: string;
   kind: string;
@@ -159,7 +169,79 @@ export interface GraphSearchResult {
   vecRank: number | null;
   cosineSimilarity: number;
   rrfScore: number;
+  via?: SearchProvenance;
   citations: GraphSearchCitation[];
+}
+
+export interface TrendGapItem {
+  conceptId: string;
+  conceptTitle: string;
+  recentSourceCount: number;
+  lastUpdated: string;
+  supportingSources: string[];
+}
+
+export interface CompetitorCoverageItem {
+  channelId: string;
+  channelTitle: string;
+  handleOrUrl: string;
+  summariesLogged: number;
+  topicsCovered: string[];
+}
+
+export interface ArmoryPipelineCard {
+  ideaId: string;
+  title: string;
+  status: "idea" | "researching" | "scripted" | "published";
+  hook: string;
+  updatedAt: string;
+}
+
+export interface CreatorDashboardData {
+  trendGaps: TrendGapItem[];
+  competitors: CompetitorCoverageItem[];
+  pipeline: ArmoryPipelineCard[];
+  counts: {
+    totalNodes: number;
+    vaultNotes: number;
+    concepts: number;
+    entities: number;
+    sources: number;
+    doctrines: number;
+    ideas: number;
+    edges: number;
+  };
+}
+
+export interface VaultSyncStats {
+  vaultPath: string;
+  totalNotes: number;
+  embeddedNotes: number;
+  skippedUnchanged: number;
+  prunedNodes: number;
+  edgesSynced: number;
+  estimatedTokens?: number;
+  repoBrainPath?: string;
+}
+
+export interface EgoGraphData {
+  centerId: string | null;
+  hops: number;
+  nodes: Array<{
+    id: string;
+    title: string;
+    kind: string;
+    cluster: string;
+    hopDistance: number;
+    vaultPath?: string | null;
+  }>;
+  edges: Array<{
+    id: string;
+    fromId: string;
+    toId: string;
+    edgeType: string;
+    confidence: number;
+  }>;
 }
 
 export interface ExtractedEntity {
@@ -277,4 +359,10 @@ export interface GraphStorageAdapter {
     rawNote: string,
     categories?: string[]
   ): Promise<WikiDigestResult>;
+  syncVault?(options?: {
+    vaultPath?: string;
+    enableAiEnrichment?: boolean;
+  }): Promise<VaultSyncStats>;
+  fetchCreatorStats?(): Promise<CreatorDashboardData>;
+  fetchEgoGraph?(nodeId?: string | null, hops?: number): Promise<EgoGraphData>;
 }

@@ -1,8 +1,15 @@
+import fs from "node:fs";
+import path from "node:path";
 import { dbQuery, sha256Hex, toUuid } from "../database/client";
 import { linkAndIndexNode } from "../services/linker";
 import { hybridGraphSearch } from "../services/search";
 import { generateNodeContextAnswer, generateWikiDigest } from "../services/ai-context";
 import { seedDefaultGraphIfEmpty } from "../services/seed";
+import {
+  getCreatorDashboardData,
+  getFilteredEgoGraph,
+} from "./creator-widgets";
+import { syncVaultToDatabase } from "../services/vault-sync";
 import type {
   CreateGraphNodeInput,
   GraphEdge,
@@ -25,13 +32,16 @@ export interface GraphApiConfig {
 function rowToGraphNode(
   row: {
     id: string;
+    vault_path?: string | null;
     title: string;
     kind: GraphNode["kind"];
     category: string;
     cluster: string;
     summary: string;
     content: string;
+    aliases?: string[];
     tags: string[];
+    props?: Record<string, unknown>;
     is_key_anchor: boolean;
     needs_attention: boolean;
     review_state: GraphNode["reviewState"];
@@ -53,13 +63,16 @@ function rowToGraphNode(
 
   return {
     id: row.id,
+    vaultPath: row.vault_path ?? null,
     title: row.title,
     kind: row.kind,
     category: row.category,
     cluster: row.cluster,
     summary: row.summary || row.title,
     content: row.content || row.summary || row.title,
+    aliases: Array.isArray(row.aliases) ? row.aliases : [],
     tags: Array.isArray(row.tags) ? row.tags : [],
+    props: row.props || {},
     connections,
     stalenessDays: Math.max(
       0,
@@ -68,7 +81,12 @@ function rowToGraphNode(
     needsAttention: Boolean(row.needs_attention),
     isKeyAnchor: Boolean(row.is_key_anchor),
     reviewState: row.review_state,
-    radius: row.kind === "project" ? 8.0 : row.is_key_anchor ? 6.5 : 4.8,
+    radius:
+      row.kind === "project" || row.kind === "doctrine"
+        ? 8.0
+        : row.is_key_anchor
+        ? 6.5
+        : 4.8,
     x: row.pos_x ?? Number((Math.cos(angle) * r).toFixed(2)),
     y: row.pos_y ?? Number(defaultY.toFixed(2)),
     z: row.pos_z ?? Number((Math.sin(angle) * r).toFixed(2)),
@@ -116,13 +134,16 @@ export function createGraphApiHandlers(config: GraphApiConfig = {}) {
 
       const nodesRes = await dbQuery<{
         id: string;
+        vault_path: string | null;
         title: string;
         kind: GraphNode["kind"];
         category: string;
         cluster: string;
         summary: string;
         content: string;
+        aliases: string[];
         tags: string[];
+        props: Record<string, unknown>;
         is_key_anchor: boolean;
         needs_attention: boolean;
         review_state: GraphNode["reviewState"];
@@ -133,8 +154,8 @@ export function createGraphApiHandlers(config: GraphApiConfig = {}) {
         created_at: string;
         updated_at: string;
       }>(
-        `SELECT id, title, kind::text AS kind, category, cluster, summary, content, tags,
-                is_key_anchor, needs_attention, review_state::text AS review_state,
+        `SELECT id, vault_path, title, kind::text AS kind, category, cluster, summary, content,
+                aliases, tags, props, is_key_anchor, needs_attention, review_state::text AS review_state,
                 pos_x, pos_y, pos_z, metadata, created_at::text, updated_at::text
            FROM graph_nodes
           WHERE merged_into_id IS NULL
@@ -555,6 +576,85 @@ export function createGraphApiHandlers(config: GraphApiConfig = {}) {
     }
   }
 
+  async function getEgoGraph(req: Request): Promise<Response> {
+    try {
+      await seedDefaultGraphIfEmpty();
+      const url = new URL(req.url);
+      const nodeId = url.searchParams.get("nodeId") || url.searchParams.get("node_id");
+      const hops = parseInt(url.searchParams.get("hops") || "2", 10);
+      const data = await getFilteredEgoGraph(nodeId, Number.isFinite(hops) ? hops : 2);
+      return Response.json(data);
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500 });
+    }
+  }
+
+  async function getCreatorStats(): Promise<Response> {
+    try {
+      await seedDefaultGraphIfEmpty();
+      const stats = await getCreatorDashboardData();
+      return Response.json(stats);
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500 });
+    }
+  }
+
+  async function syncVault(req: Request): Promise<Response> {
+    const authErr = await guard(req);
+    if (authErr) return authErr;
+
+    try {
+      let body: { vaultPath?: string; enableAiEnrichment?: boolean } = {};
+      try {
+        body = (await req.json()) as {
+          vaultPath?: string;
+          enableAiEnrichment?: boolean;
+        };
+      } catch {
+        // Empty JSON body is fine
+      }
+      const vaultDir =
+        body.vaultPath?.trim() || path.join(process.cwd(), "CortexVault");
+      const stats = await syncVaultToDatabase(vaultDir, {
+        enableAiEnrichment: Boolean(body.enableAiEnrichment),
+        exportRepoBrainPath: path.join(process.cwd(), ".cortex", "repo-brain.json"),
+      });
+      return Response.json(stats);
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500 });
+    }
+  }
+
+  async function getVaultBrainStatus(): Promise<Response> {
+    try {
+      const vaultDir = path.join(process.cwd(), "CortexVault");
+      const repoBrainFile = path.join(process.cwd(), ".cortex", "repo-brain.json");
+      const vaultExists = fs.existsSync(vaultDir);
+      let repoBrain: {
+        generatedAt?: string;
+        estimatedTokens?: number;
+        contextPack?: string;
+      } | null = null;
+      if (fs.existsSync(repoBrainFile)) {
+        try {
+          repoBrain = JSON.parse(fs.readFileSync(repoBrainFile, "utf8"));
+        } catch {
+          repoBrain = null;
+        }
+      }
+      return Response.json({
+        vaultExists,
+        vaultDir,
+        hasRepoBrain: Boolean(repoBrain),
+        generatedAt: repoBrain?.generatedAt || null,
+        estimatedTokens: repoBrain?.estimatedTokens || 0,
+        contextPack: repoBrain?.contextPack || "",
+      });
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500 });
+    }
+  }
+
   return {
     getGraph,
     createNode,
@@ -566,5 +666,9 @@ export function createGraphApiHandlers(config: GraphApiConfig = {}) {
     getNodeClaims,
     askNodeContext,
     digestNote,
+    getEgoGraph,
+    getCreatorStats,
+    syncVault,
+    getVaultBrainStatus,
   };
 }

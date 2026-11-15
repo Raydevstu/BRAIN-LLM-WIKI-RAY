@@ -4,7 +4,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 DO $$ BEGIN
   CREATE TYPE graph_node_kind AS ENUM (
-    'project', 'note', 'artifact', 'entity', 'concept', 'wiki_page', 'collection', 'custom'
+    'project', 'note', 'artifact', 'entity', 'concept', 'wiki_page', 'collection', 'source', 'doctrine', 'idea', 'custom'
   );
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
@@ -18,6 +18,7 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS graph_nodes (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  vault_path      TEXT UNIQUE,
   title           TEXT NOT NULL,
   kind            graph_node_kind NOT NULL DEFAULT 'note',
   category        TEXT NOT NULL DEFAULT 'Note',
@@ -25,7 +26,9 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
   summary         TEXT NOT NULL DEFAULT '',
   content         TEXT NOT NULL DEFAULT '',
   content_hash    TEXT NOT NULL DEFAULT '',
+  aliases         TEXT[] NOT NULL DEFAULT '{}',
   tags            TEXT[] NOT NULL DEFAULT '{}',
+  props           JSONB NOT NULL DEFAULT '{}'::jsonb,
   is_key_anchor   BOOLEAN NOT NULL DEFAULT false,
   needs_attention BOOLEAN NOT NULL DEFAULT false,
   review_state    graph_review_state NOT NULL DEFAULT 'approved',
@@ -39,9 +42,15 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
   CHECK (merged_into_id IS NULL OR merged_into_id <> id)
 );
 
+ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS vault_path TEXT;
+ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS aliases TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS props JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE UNIQUE INDEX IF NOT EXISTS graph_nodes_vault_path_uq ON graph_nodes (vault_path) WHERE vault_path IS NOT NULL;
 CREATE INDEX IF NOT EXISTS graph_nodes_kind_idx ON graph_nodes (kind);
 CREATE INDEX IF NOT EXISTS graph_nodes_cluster_idx ON graph_nodes (cluster);
 CREATE INDEX IF NOT EXISTS graph_nodes_title_trgm_idx ON graph_nodes USING gin (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS graph_nodes_aliases_gin_idx ON graph_nodes USING gin (aliases);
 CREATE INDEX IF NOT EXISTS graph_nodes_tags_gin_idx ON graph_nodes USING gin (tags);
 CREATE INDEX IF NOT EXISTS graph_nodes_fts_idx ON graph_nodes
   USING gin (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, '')));

@@ -17,6 +17,7 @@ import { GraphToolbar } from "./GraphToolbar";
 import { GraphContextMenu } from "./GraphContextMenu";
 import { NodeInspector } from "./NodeInspector";
 import { CreateNodeModal } from "./CreateNodeModal";
+import { CreatorDashboard } from "./CreatorDashboard";
 
 // Pre-allocated math helpers outside render loop (zero GC)
 const _projVec = new THREE.Vector3();
@@ -923,6 +924,14 @@ export function GraphCanvas({
           onClose={() => setDismissedNodeId(selectedNode.id)}
         />
       )}
+
+      {/* Creator OS Intelligence & Vault Sync Drawer */}
+      <CreatorDashboard
+        onSelectNode={(nodeId) => {
+          setSelectedNodeId(nodeId);
+          setDismissedNodeId(null);
+        }}
+      />
 
       {/* Node Creation & AI Digest Modal */}
       <CreateNodeModal

@@ -71,10 +71,13 @@ export const DEFAULT_NODE_KIND_META: Record<GraphNodeKind, NodeKindMeta> = {
   project: { kind: "project", label: "Project", shape: "cube", color: "#10b981" },
   note: { kind: "note", label: "Note", shape: "sphere", color: "#38bdf8" },
   artifact: { kind: "artifact", label: "Artifact", shape: "diamond", color: "#a855f7" },
-  entity: { kind: "entity", label: "Entity", shape: "octahedron", color: "#f59e0b" },
-  concept: { kind: "concept", label: "Concept", shape: "cylinder", color: "#ec4899" },
+  entity: { kind: "entity", label: "Entity", shape: "octahedron", color: "#10b981" },
+  concept: { kind: "concept", label: "Concept", shape: "cylinder", color: "#6366f1" },
   wiki_page: { kind: "wiki_page", label: "Wiki Page", shape: "sphere", color: "#14b8a6" },
-  collection: { kind: "collection", label: "Collection", shape: "torus", color: "#6366f1" },
+  collection: { kind: "collection", label: "Collection", shape: "torus", color: "#818cf8" },
+  source: { kind: "source", label: "Summary", shape: "sphere", color: "#f59e0b" },
+  doctrine: { kind: "doctrine", label: "Doctrine", shape: "cube", color: "#ef4444" },
+  idea: { kind: "idea", label: "Armory Idea", shape: "diamond", color: "#ec4899" },
   custom: { kind: "custom", label: "Custom", shape: "diamond", color: "#94a3b8" },
 };
 
@@ -84,17 +87,25 @@ export const DEFAULT_CLUSTER_HUBS: Record<string, ClusterHubConfig> = {
   research: { key: "research", label: "Research", x: 165, y: 15, z: -90, color: "#ec4899" },
   product: { key: "product", label: "Product", x: -155, y: -12, z: 125, color: "#10b981" },
   operations: { key: "operations", label: "Operations", x: 155, y: -15, z: 125, color: "#f59e0b" },
+  concepts: { key: "concepts", label: "Concepts", x: -135, y: 42, z: 65, color: "#6366f1" },
+  entities: { key: "entities", label: "Entities", x: 135, y: 38, z: -65, color: "#10b981" },
+  summaries: { key: "summaries", label: "Summaries", x: 0, y: -42, z: -145, color: "#f59e0b" },
+  doctrine: { key: "doctrine", label: "Doctrine", x: 0, y: 68, z: 115, color: "#ef4444" },
+  armory: { key: "armory", label: "Armory", x: 115, y: -38, z: 135, color: "#ec4899" },
 };
 
 const KIND_RING_RADII: Record<GraphNodeKind, { min: number; max: number }> = {
   project: { min: 25, max: 55 },
-  collection: { min: 65, max: 100 },
-  artifact: { min: 110, max: 150 },
-  wiki_page: { min: 160, max: 200 },
-  note: { min: 210, max: 250 },
-  entity: { min: 260, max: 300 },
-  concept: { min: 310, max: 355 },
-  custom: { min: 355, max: 390 },
+  doctrine: { min: 55, max: 85 },
+  collection: { min: 85, max: 115 },
+  idea: { min: 115, max: 145 },
+  artifact: { min: 145, max: 180 },
+  wiki_page: { min: 180, max: 215 },
+  source: { min: 215, max: 250 },
+  note: { min: 250, max: 285 },
+  entity: { min: 285, max: 325 },
+  concept: { min: 325, max: 365 },
+  custom: { min: 365, max: 400 },
 };
 
 function hashString(input: string): number {

@@ -1,0 +1,730 @@
+{
+  "version": "1.0.0",
+  "generatedAt": "2026-11-15T16:57:51.545Z",
+  "estimatedTokens": 983,
+  "contextPack": "# CORTEXOS VAULT CONTEXT PACK (<=1500 TOKENS)\nGenerated: 2026-11-15T16:57:51.545Z\n\n- [DOCTRINE] **Vault-first, SaaS-second** (aliases: Vault First Strategy): Building a 10-layer multi-tenant SaaS before curating a real dataset burns months\non plumbing while leaving the graph empty. Meanwhile, [[Obsidian]] + Claude Code\ndelivers Layers 1\n- [CONCEPT] **OODA Loop** (aliases: OODA): Observe -> Orient -> Decide -> Act, repeated continuously. Originally a\ncombat-strategy model; applied here to knowledge and content operations.\n- [CONCEPT] **Knowledge Graph** (aliases: KG, personal knowledge graph): Knowledge stored as nodes (concepts, entities, sources) and edges (typed or\nwiki-style links), so retrieval can traverse relationships instead of just\nmatching text.\n- [CONCEPT] **AI Second Brain** (aliases: Second Brain, LLM Wiki): A personal knowledge base maintained by an LLM acting as librarian: it\ningests sources, writes summaries, and cross-links concepts and entities so\nknowledge compounds instead of pi\n- [CONCEPT] **Subgraph Context Q&A**: Feeds a focus node and its 1-hop neighborhood into Gemini to generate grounded architectural answers.\n- [CONCEPT] **Trigram Entity Deduplication**: Uses pg_trgm similarity > 0.82 and non-destructive merged_into_id pointers to prevent duplicate concept fragmentation.\n- [CONCEPT] **Hybrid RRF Search**: Reciprocal Rank Fusion (k=60) combining English full-text search (ts_rank_cd) and dense vector cosine similarity.\n- [ENTITY] **Wes Roth** (aliases: WesRoth, @WesRoth): - Kind: YouTube channel (AI news and commentary)\n- Handle: @WesRoth\n- [ENTITY] **Obsidian** (aliases: Obsidian.md): - Kind: product (local-first Markdown knowledge base)\n- Website: https://obsidian.md\n- [ENTITY] **CortexOS** (aliases: SecondBrain-OS, BRAIN-LLM-WIKI-RAY): - Kind: project (Shaan's)\n- Goal: Knowledge Operating System - capture, connect, understand, act.\n- [ENTITY] **Andrej Karpathy** (aliases: Karpathy, @karpathy): - Kind: person (AI researcher, educator)\n- Handle: @karpathy\n- [ENTITY] **Gemini Embedding Pipeline**: 1536-dimension semantic vector indexing with 900-character overlapping chunking and deterministic offline fallback.\n- [IDEA] **I Built an AI Second Brain That Runs My Channel** (aliases: Second Brain Channel Video): Everyone builds AI wrappers—I built a local-first Knowledge OS that runs my entire YouTube research pipeline.\n- [SOURCE] **2026-11-15 - Claude Built the Ultimate Second Brain** (aliases: Wes Roth Second Brain Video): - [[Wes Roth]] demonstrates an [[AI Second Brain]] using [[Obsidian]] + Claude Code + a `CLAUDE.md` rulebook.\n- Inspired by [[Andrej Karpathy]]'s \"LLM Wiki\" workflow: immutable `Ra\n- [NOTE] **Graph Health & Staleness Audit**: Highlights unverified proposed edges, contradicting claims, and aging knowledge nodes needing review.\n- [COLLECTION] **Node & Edge Ontology**: Canonical vocabulary covering 8 node kinds and 10 directed semantic edge types with confidence scores.\n- [NOTE] **Transactional Linking Outbox**: Idempotent event queue (graph_events) coordinating asynchronous extraction, deduplication, and re-indexing.\n- [NOTE] **PGlite Local Vector Shim**: Embedded Postgres 16 runtime implementing a real[] vector domain and <=> cosine distance operator for zero-config persistence.\n- [ARTIFACT] **Three.js Spatial Canvas**: Hardware-adaptive WebGL 3D renderer with 6 morphing layouts, batched LineSegments edges, and Shift+Drag node positioning.\n- [WIKI_PAGE] **Line-Located Claim Provenance**: Verbatim source quotes anchored to exact line locators (e.g. line 14) for verifiable AI retrieval citations.\n- [ARTIFACT] **Recursive Neighborhood Walk**: Cycle-safe SQL recursive CTE function graph_neighbors(start_id, max_depth) preventing infinite loops via visited UUID arrays.\n- [PROJECT] **Knowledge Graph Core**: Unified relational graph architecture storing typed nodes, provenance-backed edges, claims, and 1536-dim vector chunks.",
+  "nodes": [
+    {
+      "id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "vault_path": "Doctrine/Vault-first, SaaS-second.md",
+      "title": "Vault-first, SaaS-second",
+      "kind": "doctrine",
+      "summary": "Building a 10-layer multi-tenant SaaS before curating a real dataset burns months\non plumbing while leaving the graph empty. Meanwhile, [[Obsidian]] + Claude Code\ndelivers Layers 1-4 and 7 in a single weekend ([[2026-11-15 - Claude Built the Ultimate Second Br",
+      "aliases": [
+        "Vault First Strategy"
+      ],
+      "tags": [
+        "strategy",
+        "architecture"
+      ],
+      "updated_at": "2026-11-15 16:57:51.252+00"
+    },
+    {
+      "id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "vault_path": "Wiki/Concepts/OODA Loop.md",
+      "title": "OODA Loop",
+      "kind": "concept",
+      "summary": "Observe -> Orient -> Decide -> Act, repeated continuously. Originally a\ncombat-strategy model; applied here to knowledge and content operations.",
+      "aliases": [
+        "OODA"
+      ],
+      "tags": [
+        "strategy"
+      ],
+      "updated_at": "2026-11-15 16:57:51.152+00"
+    },
+    {
+      "id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "vault_path": "Wiki/Concepts/Knowledge Graph.md",
+      "title": "Knowledge Graph",
+      "kind": "concept",
+      "summary": "Knowledge stored as nodes (concepts, entities, sources) and edges (typed or\nwiki-style links), so retrieval can traverse relationships instead of just\nmatching text.",
+      "aliases": [
+        "KG",
+        "personal knowledge graph"
+      ],
+      "tags": [
+        "graph",
+        "pkm"
+      ],
+      "updated_at": "2026-11-15 16:57:51.149+00"
+    },
+    {
+      "id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "vault_path": "Wiki/Concepts/AI Second Brain.md",
+      "title": "AI Second Brain",
+      "kind": "concept",
+      "summary": "A personal knowledge base maintained by an LLM acting as librarian: it\ningests sources, writes summaries, and cross-links concepts and entities so\nknowledge compounds instead of piling up. Concept credited to\n[[Andrej Karpathy]] as the \"LLM Wiki\"; demonstrated",
+      "aliases": [
+        "Second Brain",
+        "LLM Wiki"
+      ],
+      "tags": [
+        "pkm",
+        "llm"
+      ],
+      "updated_at": "2026-11-15 16:57:51.138+00"
+    },
+    {
+      "id": "e863fce9-b707-5e54-aaa4-e24cbf3781b7",
+      "vault_path": null,
+      "title": "Subgraph Context Q&A",
+      "kind": "concept",
+      "summary": "Feeds a focus node and its 1-hop neighborhood into Gemini to generate grounded architectural answers.",
+      "aliases": [],
+      "tags": [
+        "rag",
+        "context",
+        "qa"
+      ],
+      "updated_at": "2026-11-15 16:02:05.103+00"
+    },
+    {
+      "id": "6119bcda-4d70-5b7c-a4a6-ea428bd877d7",
+      "vault_path": null,
+      "title": "Trigram Entity Deduplication",
+      "kind": "concept",
+      "summary": "Uses pg_trgm similarity > 0.82 and non-destructive merged_into_id pointers to prevent duplicate concept fragmentation.",
+      "aliases": [],
+      "tags": [
+        "pg_trgm",
+        "deduplication",
+        "linking"
+      ],
+      "updated_at": "2026-11-15 16:02:05.081+00"
+    },
+    {
+      "id": "5f918fcd-9a9a-5f5b-a430-bce817ed0652",
+      "vault_path": null,
+      "title": "Hybrid RRF Search",
+      "kind": "concept",
+      "summary": "Reciprocal Rank Fusion (k=60) combining English full-text search (ts_rank_cd) and dense vector cosine similarity.",
+      "aliases": [],
+      "tags": [
+        "search",
+        "rrf",
+        "pgvector",
+        "fts"
+      ],
+      "updated_at": "2026-11-15 16:02:05.071+00"
+    },
+    {
+      "id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "vault_path": "Wiki/Entities/Wes Roth.md",
+      "title": "Wes Roth",
+      "kind": "entity",
+      "summary": "- Kind: YouTube channel (AI news and commentary)\n- Handle: @WesRoth",
+      "aliases": [
+        "WesRoth",
+        "@WesRoth"
+      ],
+      "tags": [
+        "ai-news",
+        "competitor"
+      ],
+      "updated_at": "2026-11-15 16:57:51.161+00"
+    },
+    {
+      "id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "vault_path": "Wiki/Entities/Obsidian.md",
+      "title": "Obsidian",
+      "kind": "entity",
+      "summary": "- Kind: product (local-first Markdown knowledge base)\n- Website: https://obsidian.md",
+      "aliases": [
+        "Obsidian.md"
+      ],
+      "tags": [
+        "pkm",
+        "tool"
+      ],
+      "updated_at": "2026-11-15 16:57:51.159+00"
+    },
+    {
+      "id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "vault_path": "Wiki/Entities/CortexOS.md",
+      "title": "CortexOS",
+      "kind": "entity",
+      "summary": "- Kind: project (Shaan's)\n- Goal: Knowledge Operating System - capture, connect, understand, act.",
+      "aliases": [
+        "SecondBrain-OS",
+        "BRAIN-LLM-WIKI-RAY"
+      ],
+      "tags": [
+        "project",
+        "active"
+      ],
+      "updated_at": "2026-11-15 16:57:51.157+00"
+    },
+    {
+      "id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "vault_path": "Wiki/Entities/Andrej Karpathy.md",
+      "title": "Andrej Karpathy",
+      "kind": "entity",
+      "summary": "- Kind: person (AI researcher, educator)\n- Handle: @karpathy",
+      "aliases": [
+        "Karpathy",
+        "@karpathy"
+      ],
+      "tags": [
+        "ai-research"
+      ],
+      "updated_at": "2026-11-15 16:57:51.154+00"
+    },
+    {
+      "id": "7214745f-a150-5f75-aa0d-66c3d0908cb7",
+      "vault_path": null,
+      "title": "Gemini Embedding Pipeline",
+      "kind": "entity",
+      "summary": "1536-dimension semantic vector indexing with 900-character overlapping chunking and deterministic offline fallback.",
+      "aliases": [],
+      "tags": [
+        "embeddings",
+        "gemini",
+        "chunking"
+      ],
+      "updated_at": "2026-11-15 16:02:05.085+00"
+    },
+    {
+      "id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "vault_path": "Armory/I Built an AI Second Brain That Runs My Channel.md",
+      "title": "I Built an AI Second Brain That Runs My Channel",
+      "kind": "idea",
+      "summary": "Everyone builds AI wrappers—I built a local-first Knowledge OS that runs my entire YouTube research pipeline.",
+      "aliases": [
+        "Second Brain Channel Video"
+      ],
+      "tags": [
+        "youtube",
+        "cortexos",
+        "pkm"
+      ],
+      "updated_at": "2026-11-15 16:57:51.256+00"
+    },
+    {
+      "id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "vault_path": "Wiki/Summaries/2026-11-15 - Claude Built the Ultimate Second Brain.md",
+      "title": "2026-11-15 - Claude Built the Ultimate Second Brain",
+      "kind": "source",
+      "summary": "- [[Wes Roth]] demonstrates an [[AI Second Brain]] using [[Obsidian]] + Claude Code + a `CLAUDE.md` rulebook.\n- Inspired by [[Andrej Karpathy]]'s \"LLM Wiki\" workflow: immutable `Raw/` drops distilled into `Wiki/` pages.\n- Flat folder hierarchy prevents LLM nav",
+      "aliases": [
+        "Wes Roth Second Brain Video"
+      ],
+      "tags": [
+        "pkm",
+        "llm",
+        "competitor-coverage"
+      ],
+      "updated_at": "2026-11-15 16:57:51.163+00"
+    },
+    {
+      "id": "a70e1f79-f5be-511e-acff-68af92d2830f",
+      "vault_path": null,
+      "title": "Graph Health & Staleness Audit",
+      "kind": "note",
+      "summary": "Highlights unverified proposed edges, contradicting claims, and aging knowledge nodes needing review.",
+      "aliases": [],
+      "tags": [
+        "audit",
+        "staleness",
+        "governance"
+      ],
+      "updated_at": "2026-11-15 16:02:05.127+00"
+    },
+    {
+      "id": "8a7a626f-efb5-5b8f-a06f-aae21c0b668c",
+      "vault_path": null,
+      "title": "Node & Edge Ontology",
+      "kind": "collection",
+      "summary": "Canonical vocabulary covering 8 node kinds and 10 directed semantic edge types with confidence scores.",
+      "aliases": [],
+      "tags": [
+        "ontology",
+        "schema",
+        "edges"
+      ],
+      "updated_at": "2026-11-15 16:02:05.118+00"
+    },
+    {
+      "id": "a00b35d4-67d7-56db-a363-e5f3d0196624",
+      "vault_path": null,
+      "title": "Transactional Linking Outbox",
+      "kind": "note",
+      "summary": "Idempotent event queue (graph_events) coordinating asynchronous extraction, deduplication, and re-indexing.",
+      "aliases": [],
+      "tags": [
+        "outbox",
+        "reliability",
+        "events"
+      ],
+      "updated_at": "2026-11-15 16:02:05.111+00"
+    },
+    {
+      "id": "ef004747-ce0c-5438-a93e-0700d9fd74a9",
+      "vault_path": null,
+      "title": "PGlite Local Vector Shim",
+      "kind": "note",
+      "summary": "Embedded Postgres 16 runtime implementing a real[] vector domain and <=> cosine distance operator for zero-config persistence.",
+      "aliases": [],
+      "tags": [
+        "pglite",
+        "postgres",
+        "local-first"
+      ],
+      "updated_at": "2026-11-15 16:02:05.097+00"
+    },
+    {
+      "id": "4c8b5221-cb66-5426-abad-f8186b45642e",
+      "vault_path": null,
+      "title": "Three.js Spatial Canvas",
+      "kind": "artifact",
+      "summary": "Hardware-adaptive WebGL 3D renderer with 6 morphing layouts, batched LineSegments edges, and Shift+Drag node positioning.",
+      "aliases": [],
+      "tags": [
+        "threejs",
+        "webgl",
+        "3d-graph"
+      ],
+      "updated_at": "2026-11-15 16:02:05.093+00"
+    },
+    {
+      "id": "a0e71dd2-8e40-5f62-aac1-ea24fcd5c7f6",
+      "vault_path": null,
+      "title": "Line-Located Claim Provenance",
+      "kind": "wiki_page",
+      "summary": "Verbatim source quotes anchored to exact line locators (e.g. line 14) for verifiable AI retrieval citations.",
+      "aliases": [],
+      "tags": [
+        "provenance",
+        "citations",
+        "claims"
+      ],
+      "updated_at": "2026-11-15 16:02:05.089+00"
+    },
+    {
+      "id": "5fc3dc3e-e997-5f12-ac74-3bd9aed101b6",
+      "vault_path": null,
+      "title": "Recursive Neighborhood Walk",
+      "kind": "artifact",
+      "summary": "Cycle-safe SQL recursive CTE function graph_neighbors(start_id, max_depth) preventing infinite loops via visited UUID arrays.",
+      "aliases": [],
+      "tags": [
+        "sql",
+        "cte",
+        "traversal"
+      ],
+      "updated_at": "2026-11-15 16:02:05.077+00"
+    },
+    {
+      "id": "0b601167-913c-5bfc-ae25-3a32c1501061",
+      "vault_path": null,
+      "title": "Knowledge Graph Core",
+      "kind": "project",
+      "summary": "Unified relational graph architecture storing typed nodes, provenance-backed edges, claims, and 1536-dim vector chunks.",
+      "aliases": [],
+      "tags": [
+        "architecture",
+        "graph-core",
+        "postgres"
+      ],
+      "updated_at": "2026-11-15 16:02:05.033+00"
+    }
+  ],
+  "edges": [
+    {
+      "from_id": "0b601167-913c-5bfc-ae25-3a32c1501061",
+      "to_id": "5f918fcd-9a9a-5f5b-a430-bce817ed0652",
+      "edge_type": "implements",
+      "confidence": 0.96
+    },
+    {
+      "from_id": "0b601167-913c-5bfc-ae25-3a32c1501061",
+      "to_id": "5fc3dc3e-e997-5f12-ac74-3bd9aed101b6",
+      "edge_type": "implements",
+      "confidence": 0.95
+    },
+    {
+      "from_id": "0b601167-913c-5bfc-ae25-3a32c1501061",
+      "to_id": "8a7a626f-efb5-5b8f-a06f-aae21c0b668c",
+      "edge_type": "depends_on",
+      "confidence": 0.98
+    },
+    {
+      "from_id": "0b601167-913c-5bfc-ae25-3a32c1501061",
+      "to_id": "4c8b5221-cb66-5426-abad-f8186b45642e",
+      "edge_type": "relates_to",
+      "confidence": 0.92
+    },
+    {
+      "from_id": "5f918fcd-9a9a-5f5b-a430-bce817ed0652",
+      "to_id": "7214745f-a150-5f75-aa0d-66c3d0908cb7",
+      "edge_type": "depends_on",
+      "confidence": 0.95
+    },
+    {
+      "from_id": "5f918fcd-9a9a-5f5b-a430-bce817ed0652",
+      "to_id": "ef004747-ce0c-5438-a93e-0700d9fd74a9",
+      "edge_type": "supports",
+      "confidence": 0.91
+    },
+    {
+      "from_id": "5f918fcd-9a9a-5f5b-a430-bce817ed0652",
+      "to_id": "a0e71dd2-8e40-5f62-aac1-ea24fcd5c7f6",
+      "edge_type": "derived_from",
+      "confidence": 0.89
+    },
+    {
+      "from_id": "7214745f-a150-5f75-aa0d-66c3d0908cb7",
+      "to_id": "6119bcda-4d70-5b7c-a4a6-ea428bd877d7",
+      "edge_type": "relates_to",
+      "confidence": 0.88
+    },
+    {
+      "from_id": "6119bcda-4d70-5b7c-a4a6-ea428bd877d7",
+      "to_id": "8a7a626f-efb5-5b8f-a06f-aae21c0b668c",
+      "edge_type": "supports",
+      "confidence": 0.87
+    },
+    {
+      "from_id": "a0e71dd2-8e40-5f62-aac1-ea24fcd5c7f6",
+      "to_id": "e863fce9-b707-5e54-aaa4-e24cbf3781b7",
+      "edge_type": "supports",
+      "confidence": 0.93
+    },
+    {
+      "from_id": "5fc3dc3e-e997-5f12-ac74-3bd9aed101b6",
+      "to_id": "e863fce9-b707-5e54-aaa4-e24cbf3781b7",
+      "edge_type": "implements",
+      "confidence": 0.94
+    },
+    {
+      "from_id": "4c8b5221-cb66-5426-abad-f8186b45642e",
+      "to_id": "e863fce9-b707-5e54-aaa4-e24cbf3781b7",
+      "edge_type": "relates_to",
+      "confidence": 0.86
+    },
+    {
+      "from_id": "a00b35d4-67d7-56db-a363-e5f3d0196624",
+      "to_id": "7214745f-a150-5f75-aa0d-66c3d0908cb7",
+      "edge_type": "depends_on",
+      "confidence": 0.9
+    },
+    {
+      "from_id": "a70e1f79-f5be-511e-acff-68af92d2830f",
+      "to_id": "a00b35d4-67d7-56db-a363-e5f3d0196624",
+      "edge_type": "relates_to",
+      "confidence": 0.84
+    },
+    {
+      "from_id": "a70e1f79-f5be-511e-acff-68af92d2830f",
+      "to_id": "4c8b5221-cb66-5426-abad-f8186b45642e",
+      "edge_type": "supports",
+      "confidence": 0.85
+    },
+    {
+      "from_id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "to_id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "to_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "to_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "to_id": "ef9cb419-244b-51aa-a708-d00e58fda710",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "to_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "to_id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "to_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "to_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "59be39b6-e7e1-55d9-ad58-0292d8e6f3d7",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "ef401116-ea67-544a-a8be-57f4099306be",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "f456e802-2815-5cee-a997-1235bb3b2c06",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "to_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "to_id": "0b848e27-3506-5188-ac51-556312854d0e",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "to_id": "d9023093-c861-539d-a37c-733c6eab74ac",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "to_id": "0d8da69f-1818-5e07-ad5e-35d79ea57dce",
+      "edge_type": "cited_in_source",
+      "confidence": 1
+    },
+    {
+      "from_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "to_id": "d4f84577-ebdd-5040-ac08-6f0c272e1f93",
+      "edge_type": "references",
+      "confidence": 1
+    },
+    {
+      "from_id": "d49e3fee-bef9-58a7-ab50-aa65b240be2f",
+      "to_id": "3338dbdc-6da8-5e4c-a7eb-b1a8d6e53af5",
+      "edge_type": "references",
+      "confidence": 1
+    }
+  ]
+}

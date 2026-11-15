@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Check,
   Edit3,
+  Focus,
   Link2,
   Save,
   Sparkles,
@@ -30,6 +31,8 @@ function NodeInspectorBody({
     nodes,
     edges,
     setSelectedNodeId,
+    focusIsolation,
+    setFocusIsolation,
     updateNode,
     deleteNode,
     linkNodes,
@@ -131,9 +134,27 @@ function NodeInspectorBody({
           <h2 className="mt-1 truncate text-base font-semibold text-white">
             {node.title}
           </h2>
+          {node.vaultPath && (
+            <p className="mt-0.5 truncate font-mono text-[11px] text-slate-400">
+              {node.vaultPath}
+            </p>
+          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setFocusIsolation((v) => !v)}
+            title="Isolate 2-hop Ego Neighborhood"
+            className={`inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium whitespace-nowrap shrink-0 ${
+              focusIsolation
+                ? "bg-emerald-500/20 text-emerald-300"
+                : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <Focus className="h-3.5 w-3.5" />
+            <span>2-Hop Ego</span>
+          </button>
           <button
             type="button"
             onClick={() => setIsEditing((v) => !v)}
@@ -211,8 +232,24 @@ function NodeInspectorBody({
               <p className="text-[13px] leading-relaxed text-slate-200">
                 {node.summary}
               </p>
+              {typeof node.props?.hook === "string" && node.props.hook && (
+                <p className="mt-2 border-l-2 border-pink-500/50 pl-2.5 text-xs italic text-pink-200">
+                  {node.props.hook}
+                  {typeof node.props?.status === "string" && (
+                    <span className="ml-2 font-mono text-[10px] not-italic uppercase text-pink-400">
+                      · {node.props.status}
+                    </span>
+                  )}
+                </p>
+              )}
+              {node.aliases && node.aliases.length > 0 && (
+                <div className="mt-2 font-mono text-[11px] text-slate-400">
+                  <span>Aliases: </span>
+                  <span className="text-slate-300">{node.aliases.join(" · ")}</span>
+                </div>
+              )}
               {node.tags.length > 0 && (
-                <div className="mt-2.5 flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-slate-400">
+                <div className="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-slate-400">
                   {node.tags.map((tag, idx) => (
                     <React.Fragment key={tag}>
                       {idx > 0 && <span aria-hidden="true">·</span>}
@@ -263,7 +300,8 @@ function NodeInspectorBody({
           </h3>
           <div className="space-y-1.5">
             {connectedEdges.map((edge) => {
-              const otherId = edge.fromId === node.id ? edge.toId : edge.fromId;
+              const isOut = edge.fromId === node.id;
+              const otherId = isOut ? edge.toId : edge.fromId;
               const other = nodeMap.get(otherId);
               if (!other) return null;
               return (
@@ -280,7 +318,7 @@ function NodeInspectorBody({
                   </button>
                   <div className="flex shrink-0 items-center gap-2">
                     <span className="font-mono text-[11px] text-slate-400">
-                      {edge.edgeType}
+                      {isOut ? "→" : "←"} {edge.edgeType}
                     </span>
                     <button
                       type="button"

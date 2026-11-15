@@ -22,3 +22,4 @@ export { GraphSearch } from "./components/GraphSearch";
 export { GraphContextMenu } from "./components/GraphContextMenu";
 export { NodeInspector } from "./components/NodeInspector";
 export { CreateNodeModal } from "./components/CreateNodeModal";
+export { CreatorDashboard } from "./components/CreatorDashboard";
