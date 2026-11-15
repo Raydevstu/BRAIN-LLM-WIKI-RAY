@@ -1,0 +1,6 @@
+{
+  "name": "Cortex Graph Engine",
+  "description": "Portable 3D knowledge graph workspace with PostgreSQL/PGlite hybrid FTS + vector search and Gemini AI knowledge linking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@cortex/graph-engine",
+  "version": "1.0.0",
+  "description": "Portable 3D Knowledge Graph, Hybrid Vector/FTS Retrieval, and AI Linking Engine",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./server.ts",
+    "./styles.css": "./styles/graph.css"
+  },
+  "peerDependencies": {
+    "lucide-react": ">=0.400.0",
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0",
+    "three": ">=0.165.0"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@google/genai": "^2.4.0",
+    "postgres": "^4.1.1"
+  },
+  "devDependencies": {
+    "@types/react": ">=18.0.0",
+    "@types/three": ">=0.165.0",
+    "typescript": ">=5.5.0"
+  }
+}
